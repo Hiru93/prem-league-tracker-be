@@ -1,0 +1,314 @@
+// Prem League Tracker — Prisma schema
+//
+// Canonical source: docs/data-model-technical.md, plus field-level detail from
+// docs/tournament-stage-technical.md, docs/league-scoring-technical.md,
+// docs/player-technical.md, docs/decklists-technical.md, docs/security-technical.md.
+//
+// Some module docs (tournament-stage-technical.md, league-scoring-technical.md,
+// player-technical.md) define Stage/Placement/Player with different names and
+// richer fields than data-model-technical.md's own high-level sketch (e.g.
+// StagePlacement vs Placement, meleeTournamentId vs meleeEventId). This schema
+// follows the module docs, since they're what the Phase 1 GitHub issues
+// reference directly and are more complete — see the Phase 1 tracking issue
+// for the follow-up to reconcile data-model-technical.md's sketch to match.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Leagues, seasons, admin auth (data-model-technical.md, security-technical.md)
+// ---------------------------------------------------------------------------
+
+model League {
+  id                         String   @id @default(cuid())
+  name                       String
+  slug                       String   @unique
+  meleeOrgId                 String   @unique
+  meleeClientIdEncrypted     String
+  meleeClientSecretEncrypted String
+  createdAt                  DateTime @default(now())
+
+  seasons     Season[]
+  adminAccess AdminLeagueAccess[]
+
+  @@index([slug])
+}
+
+model Season {
+  id                     String                 @id @default(cuid())
+  leagueId               String
+  league                 League                 @relation(fields: [leagueId], references: [id])
+  name                   String
+  year                   Int
+  isActive               Boolean                @default(false)
+  decklistVisibilityMode DecklistVisibilityMode @default(HIDDEN_UNTIL_STAGE_CLOSE)
+  startsAt               DateTime?
+  endsAt                 DateTime?
+  createdAt              DateTime               @default(now())
+
+  stages Stage[]
+
+  @@index([year])
+  @@index([leagueId])
+}
+
+enum DecklistVisibilityMode {
+  HIDDEN_UNTIL_STAGE_CLOSE
+  ALWAYS_VISIBLE
+}
+
+model AdminUser {
+  id                  String    @id @default(cuid())
+  email               String    @unique
+  passwordHash        String
+  displayName         String?
+  role                AdminRole @default(ORGANIZER)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+  createdAt           DateTime  @default(now())
+  lastLoginAt         DateTime?
+
+  leagueAccess    AdminLeagueAccess[]
+  refreshTokens   RefreshToken[]
+  auditLogEntries AuditLog[]
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  ORGANIZER
+  MODERATOR
+}
+
+model AdminLeagueAccess {
+  id          String    @id @default(cuid())
+  adminUserId String
+  adminUser   AdminUser @relation(fields: [adminUserId], references: [id])
+  leagueId    String
+  league      League    @relation(fields: [leagueId], references: [id])
+  grantedAt   DateTime  @default(now())
+  grantedBy   String
+
+  @@unique([adminUserId, leagueId])
+  @@index([leagueId])
+}
+
+model RefreshToken {
+  id          String    @id @default(cuid())
+  adminUserId String
+  adminUser   AdminUser @relation(fields: [adminUserId], references: [id])
+  tokenHash   String    @unique
+  familyId    String
+  deviceLabel String?
+  ipAddress   String?
+  revoked     Boolean   @default(false)
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+
+  @@index([adminUserId])
+  @@index([familyId])
+}
+
+model AuditLog {
+  id          String     @id @default(cuid())
+  adminUserId String?
+  adminUser   AdminUser? @relation(fields: [adminUserId], references: [id])
+  action      String
+  targetType  String?
+  targetId    String?
+  metadata    Json?
+  createdAt   DateTime   @default(now())
+
+  @@index([adminUserId])
+  @@index([targetType, targetId])
+}
+
+// ---------------------------------------------------------------------------
+// Stages (tournament-stage-technical.md)
+// ---------------------------------------------------------------------------
+
+enum StageStatus {
+  OPEN
+  IN_PROGRESS
+  CLOSED
+}
+
+model Stage {
+  id                String      @id @default(cuid())
+  seasonId          String
+  season            Season      @relation(fields: [seasonId], references: [id])
+  name              String
+  sequence          Int
+  isFinal           Boolean     @default(false)
+  excluded          Boolean     @default(false)
+  meleeTournamentId String?     @unique
+  meleeUrl          String?
+  status            StageStatus @default(OPEN)
+  playerCount       Int?
+  scheduledAt       DateTime?
+  closedAt          DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  placements StagePlacement[]
+  pairings   StagePairing[]
+  syncLogs   StageSyncLog[]
+  decklists  Decklist[]
+
+  @@index([seasonId, sequence])
+}
+
+model StagePairing {
+  id          String   @id @default(cuid())
+  stageId     String
+  stage       Stage    @relation(fields: [stageId], references: [id])
+  round       Int
+  tableNumber Int?
+  player1Id   String
+  player1     Player   @relation("Player1Pairings", fields: [player1Id], references: [id])
+  player2Id   String?
+  player2     Player?  @relation("Player2Pairings", fields: [player2Id], references: [id])
+  result      String?
+  createdAt   DateTime @default(now())
+
+  @@index([stageId, round])
+}
+
+model StageSyncLog {
+  id          String    @id @default(cuid())
+  stageId     String
+  stage       Stage     @relation(fields: [stageId], references: [id])
+  triggeredBy String
+  status      String
+  message     String?   @db.Text
+  startedAt   DateTime  @default(now())
+  finishedAt  DateTime?
+}
+
+// ---------------------------------------------------------------------------
+// Scoring (league-scoring-technical.md)
+// ---------------------------------------------------------------------------
+
+model StagePlacement {
+  id        String   @id @default(cuid())
+  stageId   String
+  stage     Stage    @relation(fields: [stageId], references: [id])
+  playerId  String
+  player    Player   @relation(fields: [playerId], references: [id])
+  placement Int
+  fieldSize Int
+  points    Int
+  createdAt DateTime @default(now())
+
+  @@unique([stageId, playerId])
+  @@index([stageId, placement])
+  @@index([playerId])
+}
+
+// ---------------------------------------------------------------------------
+// Players (player-technical.md, data-model-technical.md's merge fields)
+// ---------------------------------------------------------------------------
+
+model Player {
+  id             String   @id @default(cuid())
+  displayName    String
+  meleeProfileId String?  @unique
+  mergedIntoId   String?
+  mergedInto     Player?  @relation("PlayerMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom     Player[] @relation("PlayerMerge")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  aliases         PlayerAlias[]
+  placements      StagePlacement[]
+  decklists       Decklist[]
+  player1Pairings StagePairing[]   @relation("Player1Pairings")
+  player2Pairings StagePairing[]   @relation("Player2Pairings")
+
+  @@index([displayName])
+}
+
+model PlayerAlias {
+  id             String   @id @default(cuid())
+  playerId       String
+  player         Player   @relation(fields: [playerId], references: [id])
+  rawName        String
+  normalizedName String
+  meleeUserId    String?
+  sourceStageId  String?
+  createdAt      DateTime @default(now())
+
+  @@unique([normalizedName, playerId])
+  @@index([normalizedName])
+  @@index([meleeUserId])
+}
+
+model UnresolvedPlayerMatch {
+  id                 String    @id @default(cuid())
+  stageId            String
+  rawName            String
+  normalizedName     String
+  candidatePlayerIds Json
+  status             String    @default("PENDING")
+  resolvedPlayerId   String?
+  resolvedBy         String?
+  resolvedAt         DateTime?
+  createdAt          DateTime  @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Decklists (decklists-technical.md, reconciled with data-model-technical.md in issue #75)
+// ---------------------------------------------------------------------------
+
+model Decklist {
+  id               String         @id @default(cuid())
+  stageId          String
+  stage            Stage          @relation(fields: [stageId], references: [id])
+  playerId         String
+  player           Player         @relation(fields: [playerId], references: [id])
+  meleeDecklistUrl String?
+  archetypeName    String?
+  meleeDecklistId  String?        @unique
+  snapshotLabel    String?
+  isLatest         Boolean        @default(true)
+  submittedAt      DateTime?
+  status           DecklistStatus @default(COMPLETE)
+  rawSource        Json?
+  createdAt        DateTime       @default(now())
+
+  entries DecklistEntry[]
+
+  @@index([stageId, playerId, isLatest])
+}
+
+enum DecklistStatus {
+  COMPLETE
+  PARTIAL
+  MISSING
+}
+
+model DecklistEntry {
+  id              String          @id @default(cuid())
+  decklistId      String
+  decklist        Decklist        @relation(fields: [decklistId], references: [id])
+  rawCardName     String
+  quantity        Int
+  isSideboard     Boolean         @default(false)
+  resolved        Boolean         @default(false)
+  matchConfidence MatchConfidence @default(UNMATCHED)
+  scryfallCardId  String?
+
+  @@index([decklistId])
+}
+
+enum MatchConfidence {
+  EXACT
+  FUZZY
+  UNMATCHED
+}

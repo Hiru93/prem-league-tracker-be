@@ -15,12 +15,36 @@ Given all of that, Postgres is the right tool: a mature, well-understood relatio
 
 ## What we store
 
-- **Seasons** — a fresh league runs each year, so every stage (and the season-ending final) belongs to a specific season rather than there being one league forever.
-- League stages (tappe) and each player's final placement in them, each scoped to a season. The season-ending final tournament is stored the same way as a stage, but flagged separately since its results are shown but don't count toward league points (see `league-scoring-overview.md`).
+- **Leagues** — the platform can run more than one league at once (see "Leagues: running more than one at a time" below). Every other piece of data ultimately traces back to exactly one league.
+- **Seasons** — a fresh league edition runs each year, so every stage (and the season-ending final) belongs to a specific season, which in turn belongs to exactly one league — rather than there being one league forever.
+- League stages (tappe) and each player's final placement in them, each scoped to a season. The season-ending final tournament is stored the same way as a stage, but flagged separately since its results are shown but don't count toward league points (see `league-scoring-overview.md`). A stage can also be marked excluded by an admin — see below.
 - Players (name, and enough identity info to match them across stages).
 - Decklists submitted per player per stage, and the individual cards in them, plus a visibility setting per season (decklists default to hidden until their stage closes — see `decklists-overview.md`).
-- Admin accounts for whoever operates the site (Mattia, and potentially other moderators later), used to log in and unlock admin-only actions (see `security-overview.md`).
+- Admin accounts for whoever operates the site — Mattia, and other league organizers/moderators — used to log in and unlock admin-only actions (see `security-overview.md`).
 - A cache of card art/text looked up from Scryfall, so we don't need to ask Scryfall the same question over and over (see `scryfall-integration-overview.md`).
+
+## Leagues: running more than one at a time
+
+Prem League Tracker isn't just Mattia's one league forever — it's a small platform that can host **several leagues concurrently**, each completely independent of the others. A league is the top-level container: it has its own name, its own melee.gg organization (the tournaments it pulls stage results from), and its own set of admins. One league's seasons, stages, players, and decklists never mix with another's.
+
+Concretely, a **league** owns:
+
+- Its own melee.gg organization — every tournament run under that org is what feeds this league's stages (see `melee-integration-overview.md` for how that sync works).
+- That org's melee.gg API credentials, stored encrypted (see `security-overview.md`) — never shared with another league, even if the same person happens to organize both.
+- Its own sequence of seasons. Unlike the original single-league design, more than one league can have an "active" season running at the same time — this is genuinely multiple leagues operating side by side, not one league with a swappable data source.
+- Its own admins, who can only manage the league(s) they've been explicitly given access to (see "Admin roles" below).
+
+Visitors discover leagues through a landing page that lists the currently-active ones; picking a league takes you into its own standings, stages, and decklists, with stable URLs scoped to that league from then on.
+
+## Admin roles
+
+Every admin account now has one of three roles, reflecting that admin work is scoped per league rather than being one flat "the admin" concept:
+
+- **Super-admin** — exactly one account (Mattia's). Has access to everything, everywhere: every league, every season, every admin account. It's the only role that can create new leagues and create/assign other admins. There's no button or API call that can ever create a second super-admin account — that can only happen by someone with direct database access, on purpose.
+- **Organizer** — a full admin for whichever league(s) they've been assigned to: triggering syncs, correcting data, managing seasons, merging duplicate players, toggling decklist visibility, and so on, but only within their assigned league(s).
+- **Moderator** — the same day-to-day abilities as an organizer within their assigned league(s), except a moderator can't grant admin access to anyone else. Only the super-admin can do that, which avoids a compromised organizer or moderator account being used to add more admins.
+
+See `security-overview.md` for the full login/authentication model these roles sit inside.
 
 ## Related docs
 

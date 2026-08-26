@@ -18,13 +18,34 @@ src/
     prisma.module.ts        # @Global() — exports PrismaService
     prisma.service.ts       # extends PrismaClient, implements OnModuleInit/OnModuleDestroy
 
-  stages/                   # StagesModule — tournament stages (tappe)
+  leagues/                  # LeaguesModule — League CRUD (creation is SUPER_ADMIN-only), the league-picker landing list
+    leagues.module.ts
+    leagues.controller.ts
+    leagues.service.ts
+    dto/
+
+  auth/                     # AuthModule — admin login/refresh/logout, AdminAuthGuard, LeagueAccessGuard, AuditLogService
+    auth.module.ts
+    auth.controller.ts      # POST /admin/auth/login|refresh|logout|logout-all
+    auth.service.ts
+    admin-auth.guard.ts
+    league-access.guard.ts
+    audit-log.service.ts    # AuditLogService.record(...) — see security-technical.md §Audit logging
+    dto/
+
+  admin-users/               # AdminUsersModule — SUPER_ADMIN-only creation of ORGANIZER/MODERATOR AdminUsers + AdminLeagueAccess grants
+    admin-users.module.ts
+    admin-users.controller.ts # POST /admin/users
+    admin-users.service.ts
+    dto/
+
+  stages/                   # StagesModule — tournament stages (tappe), now league-scoped (GET /leagues/:leagueSlug/stages)
     stages.module.ts
     stages.controller.ts
     stages.service.ts
     dto/
 
-  players/                  # PlayersModule — player roster, profile
+  players/                  # PlayersModule — player roster, profile, and the player-merge admin action
     players.module.ts
     players.controller.ts
     players.service.ts
@@ -36,15 +57,17 @@ src/
     decklists.service.ts
     dto/
 
-  scoring/                  # ScoringModule — placement -> points formula, standings aggregation
+  scoring/                  # ScoringModule — placement -> points formula, standings aggregation (per Season, excluding isFinal/excluded stages)
     scoring.module.ts
     scoring.service.ts      # no controller of its own; consumed by StagesModule/PlayersModule
     config/scoring.config.ts
 
-  melee-integration/        # MeleeIntegrationModule — ingestion from melee.gg
+  melee-integration/        # MeleeIntegrationModule — per-League ingestion from melee.gg: auto-include, scheduled + manual sync
     melee-integration.module.ts
-    melee-integration.controller.ts   # admin-triggered sync endpoint(s)
-    melee-integration.service.ts
+    melee-sync.controller.ts   # POST /admin/leagues/:leagueId/sync, PATCH .../stages/:stageId/excluded
+    melee-sync.service.ts
+    melee-sync.scheduler.ts    # @nestjs/schedule cron, once/day, iterates every League
+    melee-credentials.provider.ts # decrypts a League's melee.gg credentials at point of use
     melee.client.ts
 
   scryfall/                 # ScryfallModule — Scryfall card resolution + cache
@@ -59,7 +82,12 @@ src/
     pipes/
 ```
 
-This maps directly onto the five other documentation areas: `tournament-stage-technical.md` (StagesModule), `player-technical.md` (PlayersModule), `decklists-technical.md` (DecklistsModule), `league-scoring-technical.md` (ScoringModule), `melee-integration-technical.md` (MeleeIntegrationModule), and this repo's `scryfall-integration-technical.md` (ScryfallModule). The full persisted schema behind all of them is defined once in `data-model-technical.md` — modules do not each own a separate schema, they share the one Prisma schema and one Postgres database.
+This maps directly onto the other documentation areas: `data-model-technical.md`/`security-technical.md` (LeaguesModule, AuthModule, AdminUsersModule), `tournament-stage-technical.md` (StagesModule), `player-technical.md` (PlayersModule), `decklists-technical.md` (DecklistsModule), `league-scoring-technical.md` (ScoringModule), `melee-integration-technical.md` (MeleeIntegrationModule), and this repo's `scryfall-integration-technical.md` (ScryfallModule). The full persisted schema behind all of them is defined once in `data-model-technical.md` — modules do not each own a separate schema, they share the one Prisma schema and one Postgres database.
+
+**New modules, 2026-08-26 (second corner-case review)**:
+- **`LeaguesModule`** — owns `League` CRUD. Creation (`POST /admin/leagues`) is `SUPER_ADMIN`-only (a league's melee.gg org/credentials are sensitive enough that only the super-admin registers a new tenant), but the module also serves the public league-picker landing list (`GET /leagues`) and per-league lookup by slug used by every other league-scoped route.
+- **`AuthModule`** — owns the whole login/refresh/logout flow (`security-technical.md`'s Login/Refresh/Logout flows) and both authorization guards (`AdminAuthGuard`, `LeagueAccessGuard`), since guards and the token flow they depend on are tightly coupled and easiest to reason about in one module. `AuditLogService` is folded into `AuthModule` rather than split into a separate `AuditLogModule` — audit logging is overwhelmingly triggered by the same guarded-mutation call sites `AuthModule` already owns the guards for, and at this project's scale a dedicated module would just be an extra import everywhere for no isolation benefit; every other feature module injects `AuditLogService` from `AuthModule`'s exports the same way it injects `PrismaService` from the global `PrismaModule`.
+- **`AdminUsersModule`** — separate from `AuthModule` because it owns a different concern: `SUPER_ADMIN`-only creation of `ORGANIZER`/`MODERATOR` `AdminUser` rows and granting their initial `AdminLeagueAccess` (`POST /admin/users`), not authentication itself. Kept apart so `AuthModule` stays focused on "prove who you are" while `AdminUsersModule` handles "who gets to exist as an admin at all."
 
 ## Layering convention (per feature module)
 
@@ -92,10 +120,11 @@ MeleeIntegrationModule ──▶ StagesModule ──▶ ScoringModule
                  ScryfallModule
 ```
 
-- `MeleeIntegrationModule` orchestrates ingestion: on sync, it creates/updates `Stage`, `Placement`, `Player`, and `Decklist`/`DecklistEntry` rows, so it depends on `StagesModule`, `PlayersModule`, and `DecklistsModule`'s services (each module exports the service methods ingestion needs, e.g. `StagesService.upsertStageResult(...)`).
+- `MeleeIntegrationModule` orchestrates ingestion: on sync, it creates/updates `Stage`, `Placement`, `Player`, and `Decklist`/`DecklistEntry` rows, so it depends on `StagesModule`, `PlayersModule`, and `DecklistsModule`'s services (each module exports the service methods ingestion needs, e.g. `StagesService.upsertStageResult(...)`). It also depends on `LeaguesModule` to resolve a `League`'s `meleeOrgId` and decrypted credentials before a sync run.
 - `DecklistsModule` depends on `ScryfallModule` to resolve each `DecklistEntry`'s card data at ingestion time.
 - `StagesModule` and `PlayersModule` depend on `ScoringModule` to compute per-stage points and aggregate league standings.
 - `ScoringModule` and `ScryfallModule` are "leaf" modules — they depend only on `PrismaModule`, not on other feature modules — so they're easy to unit test and reuse.
+- `AuthModule` and `AdminUsersModule` sit outside the ingestion/scoring dependency chain above — every other feature module's controllers depend on `AuthModule`'s exported guards (`AdminAuthGuard`, `LeagueAccessGuard`) and `AuditLogService` for their admin-facing routes, but `AuthModule` itself only depends on `PrismaModule`. `LeaguesModule` is depended on by `MeleeIntegrationModule` (above) and by every league-scoped controller that needs to resolve a `:leagueSlug`/`:leagueId` param, but doesn't depend on any other feature module itself.
 
 Each module's `*.module.ts` explicitly lists `imports: []` for the modules it depends on and `exports: []` for the service(s) it makes available; no module reaches into another module's internals (repository classes, if any, are never exported).
 

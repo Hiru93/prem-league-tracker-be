@@ -10,7 +10,7 @@ NestJS gives structure "for free": it enforces a modular architecture (features 
 
 ## How the code is organized, in plain terms
 
-Each feature area of the league (stages, players, decklists, scoring, the melee.gg import, the Scryfall lookup) lives in its own self-contained folder/module. A module typically has three layers:
+Each feature area of the league (stages, players, decklists, scoring, the melee.gg import, the Scryfall lookup) lives in its own self-contained folder/module. Since the second corner-case review (2026-08-26), the platform also runs multiple leagues at once, each its own tenant — so there are three more modules alongside the league-feature ones: one owning leagues themselves (creating a league, listing them for the public league picker), one owning admin login (JWT access tokens, rotating refresh-token cookies, and the guards every admin route depends on), and one owning admin-account creation (kept separate from login since only the super-admin can create other admins). See `backend-architecture-technical.md` for the exact module list. A module typically has three layers:
 
 - **Controller** — handles incoming HTTP requests, does no business logic itself.
 - **Service** — contains the actual logic (e.g. "compute standings for this league").

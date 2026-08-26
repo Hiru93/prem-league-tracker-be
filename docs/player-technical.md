@@ -2,16 +2,20 @@
 
 Defines the player entity, name normalization/reconciliation strategy, and duplicate handling. This is a defensive, semi-manual matching approach — not fuzzy-match-and-auto-merge — because a wrong auto-merge silently corrupts league history (mixes two people's results), which is worse than a temporary duplicate that a human can fix.
 
-Related: `tournament-stage-technical.md` (source of per-stage player appearances), `melee-integration-technical.md` (where raw names originate), `decklists-technical.md`, `league-scoring-technical.md`, `data-model-technical.md` (canonical `Player.mergedIntoId` tombstone field, referenced in §8's merge action), `security-technical.md` (the `AdminAuthGuard`/`LeagueAccessGuard` pair protecting §8's merge endpoint).
+Related: `tournament-stage-technical.md` (source of per-stage player appearances), `melee-integration-technical.md` (where raw names originate), `decklists-technical.md`, `league-scoring-technical.md`, `data-model-technical.md` (`League`/`Season`/`AdminUser` and the rest of the platform-level schema — as of 2026-08-26/issue #82, `Player` itself, including the `mergedIntoId` tombstone field used by §8's merge action, is canonical *here*, not there), `security-technical.md` (the `AdminAuthGuard`/`LeagueAccessGuard` pair protecting §8's merge endpoint).
 
 ## 1. Data model
 
 ```prisma
 model Player {
-  id            String   @id @default(cuid())
-  displayName   String   // canonical name shown in UI, admin-editable
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id             String   @id @default(cuid())
+  displayName    String   // canonical name shown in UI, admin-editable
+  meleeProfileId String?  @unique // melee.gg profile id, if resolvable, for cross-stage matching
+  mergedIntoId   String?  // set when an admin merges this (duplicate) player into another — see §8. A tombstone, not a delete: preserves the audit trail (data-model-technical.md's historical-integrity principle).
+  mergedInto     Player?  @relation("PlayerMerge", fields: [mergedIntoId], references: [id])
+  mergedFrom     Player[] @relation("PlayerMerge")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   aliases       PlayerAlias[]
   placements    StagePlacement[]
@@ -155,7 +159,7 @@ Sometimes the same real person still ends up as two different `Player` rows — 
 POST /admin/leagues/:leagueId/players/:duplicateId/merge-into/:canonicalId
 ```
 
-Guarded by `AdminAuthGuard` + `LeagueAccessGuard` (see `security-technical.md`) — `SUPER_ADMIN`, `ORGANIZER`, and `MODERATOR` can all perform a merge within a league they have `AdminLeagueAccess` for, same as the other guarded per-league admin actions (triggering a sync, resolving a player match, toggling decklist visibility). `:leagueId` scopes the guard check; `:duplicateId`/`:canonicalId` themselves are not season- or league-scoped identifiers (per §4a, `Player` identity spans every season a person has played), but both `Player` rows must have at least one `Placement`/`Decklist` reachable to a `Stage` in this league for the action to make sense — the endpoint doesn't hard-block a cross-league merge attempt at the data layer, but the guard's `:leagueId` requirement means an admin without access to a player's actual league can't reach this endpoint for them in the first place.
+Guarded by `AdminAuthGuard` + `LeagueAccessGuard` (see `security-technical.md`) — `SUPER_ADMIN`, `ORGANIZER`, and `MODERATOR` can all perform a merge within a league they have `AdminLeagueAccess` for, same as the other guarded per-league admin actions (triggering a sync, resolving a player match, toggling decklist visibility). `:leagueId` scopes the guard check; `:duplicateId`/`:canonicalId` themselves are not season- or league-scoped identifiers (per §4a, `Player` identity spans every season a person has played), but both `Player` rows must have at least one `StagePlacement`/`Decklist` reachable to a `Stage` in this league for the action to make sense — the endpoint doesn't hard-block a cross-league merge attempt at the data layer, but the guard's `:leagueId` requirement means an admin without access to a player's actual league can't reach this endpoint for them in the first place.
 
 ```ts
 interface MergePlayersRequest {
@@ -173,12 +177,12 @@ interface MergePlayersResponse {
 
 What happens, in a single transaction:
 
-1. Every `Placement` row belonging to `duplicateId` is reassigned to `canonicalId` (`playerId` updated in place) — not copied, not deleted, the same row now points at the canonical player. If a `Placement` already exists for `canonicalId` on the same `stageId` (both the duplicate and the canonical player somehow have a row for the same stage — normally shouldn't happen, but is possible if the duplicate arose mid-season), the reassignment is rejected for that row and surfaced as a conflict (§9) rather than silently dropping one — an admin needs to resolve which one is correct first.
+1. Every `StagePlacement` row belonging to `duplicateId` is reassigned to `canonicalId` (`playerId` updated in place) — not copied, not deleted, the same row now points at the canonical player. If a `StagePlacement` already exists for `canonicalId` on the same `stageId` (both the duplicate and the canonical player somehow have a row for the same stage — normally shouldn't happen, but is possible if the duplicate arose mid-season), the reassignment is rejected for that row and surfaced as a conflict (§9) rather than silently dropping one — an admin needs to resolve which one is correct first.
 2. Every `Decklist` row belonging to `duplicateId` is reassigned the same way, subject to the same per-stage conflict check as step 1 (`Decklist` also has a `@@unique([stageId, playerId])` constraint, per `decklists-technical.md`).
-3. `duplicateId`'s `Player.mergedIntoId` is set to `canonicalId` — a **tombstone, not a delete** (per `data-model-technical.md`'s historical-integrity principle). The duplicate row survives so standings/decklist history built before the merge stays queryable and auditable; it just no longer owns any `Placement`/`Decklist` rows directly (those were reassigned in steps 1–2).
+3. `duplicateId`'s `Player.mergedIntoId` is set to `canonicalId` — a **tombstone, not a delete** (per `data-model-technical.md`'s historical-integrity principle). The duplicate row survives so standings/decklist history built before the merge stays queryable and auditable; it just no longer owns any `StagePlacement`/`Decklist` rows directly (those were reassigned in steps 1–2).
 4. An `AuditLog` row is written (`action: "PLAYER_MERGE"`, `targetType: "Player"`, `targetId: duplicateId`, `metadata: { canonicalPlayerId, placementsReassigned, decklistsReassigned }`).
 
-After a merge, `duplicateId`'s own `mergedFrom`/`mergedInto` relation (see `data-model-technical.md`) exists purely for admin-UI/audit purposes — application code reading `Placement`/`Decklist` doesn't need to "follow" `mergedIntoId` to find the canonical player's data, since the rows themselves were reassigned in steps 1–2, not left in place with a redirect. A direct `GET /players/:duplicateId` lookup after a merge should redirect or 301 to the canonical player's profile (frontend concern, `player-technical.md` §6's route) rather than showing an empty/stale profile.
+After a merge, `duplicateId`'s own `mergedFrom`/`mergedInto` relation (see `data-model-technical.md`) exists purely for admin-UI/audit purposes — application code reading `StagePlacement`/`Decklist` doesn't need to "follow" `mergedIntoId` to find the canonical player's data, since the rows themselves were reassigned in steps 1–2, not left in place with a redirect. A direct `GET /players/:duplicateId` lookup after a merge should redirect or 301 to the canonical player's profile (frontend concern, `player-technical.md` §6's route) rather than showing an empty/stale profile.
 
 `PlayerAlias` rows are **not** reassigned by a merge — they stay attached to whichever `Player.id` they were originally created under. This is intentional: `duplicateId`'s aliases remain a historical record of "these raw names used to resolve to this now-merged row," which matters for debugging future ingestions, even though `duplicateId` no longer holds any placements/decklists directly.
 
@@ -186,5 +190,5 @@ After a merge, `duplicateId`'s own `mergedFrom`/`mergedInto` relation (see `data
 
 - **Two players legitimately share the same normalized name** (two different real people, e.g. two "Marco Rossi"s): normalization alone cannot distinguish them. This is exactly why exact-normalized-name matches still go through the alias/candidate flow rather than blind auto-attach on first sight from a brand-new stage source with no prior alias — in practice, once `PlayerAlias.normalizedName` already resolves uniquely to one `Player`, a second distinct person with the same name will still be incorrectly matched unless caught manually. **Open question / limitation**: there is no reliable automatic disambiguation for two distinct real people who share an identical (post-normalization) name; this is called out as a known limitation for the organizer to catch during manual resolution (e.g. via `meleeUserId` divergence in §3 step 2, if melee.gg provides it) rather than solved automatically — the player-merge action in §8 is the fix once such a case is noticed after the fact.
 - **`meleeUserId` present for some stages but not others** (e.g. melee.gg changes what it exposes over time): matching falls back to normalized-name/fuzzy matching per §3 for stages missing it; this is expected, not an error condition.
-- **Merge attempted where `duplicateId` and `canonicalId` share a `Placement`/`Decklist` on the same `stageId`** (§8 step 1/2): `409 Conflict`, listing the colliding `stageId`(s) — the admin must resolve which row is authoritative (e.g. delete/correct one manually) before the merge can proceed; the endpoint never silently picks a winner.
+- **Merge attempted where `duplicateId` and `canonicalId` share a `StagePlacement`/`Decklist` on the same `stageId`** (§8 step 1/2): `409 Conflict`, listing the colliding `stageId`(s) — the admin must resolve which row is authoritative (e.g. delete/correct one manually) before the merge can proceed; the endpoint never silently picks a winner.
 - **Merge attempted with `duplicateId === canonicalId`, or where `duplicateId` already has a non-null `mergedIntoId`** (already merged into something): `400 Bad Request` — a player can't be merged into itself, and a merge chain (A merged into B, B merged into C) is not supported; re-pointing an already-merged player requires a `SUPER_ADMIN`-level manual correction, not this endpoint.

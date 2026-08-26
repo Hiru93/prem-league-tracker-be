@@ -107,7 +107,7 @@ Per the second corner-case review, ingestion is no longer solely admin-triggered
 There is no admin step to pick which tournaments count. On each sync run for a `League`, `MeleeSyncService`:
 
 1. Calls `GET /api/tournament/list` scoped to that league's `meleeOrgId` (§3).
-2. For every tournament returned that doesn't yet have a matching `Stage.meleeEventId`, creates a new `Stage` row for it (attached to that league's currently-active `Season`, per `Season.isActive`) — this is the auto-include: showing up under the org is sufficient, there's no separate "approve this tournament" action anywhere in the admin flow.
+2. For every tournament returned that doesn't yet have a matching `Stage.meleeTournamentId`, creates a new `Stage` row for it (attached to that league's currently-active `Season`, per `Season.isActive`) — this is the auto-include: showing up under the org is sufficient, there's no separate "approve this tournament" action anywhere in the admin flow.
 3. For every tournament that already has a matching `Stage`, re-fetches and refreshes its standings/decklists if the tournament's status has changed since the last sync (e.g. it has since closed).
 
 This deliberately trades "an admin might occasionally get an unwanted tournament synced in" for "no admin ever has to remember to manually add a stage" — the corner-case review's judgment was that the latter's day-to-day convenience outweighs the former's occasional cleanup, especially since §2c below makes the cleanup cheap and non-destructive.

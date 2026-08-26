@@ -20,7 +20,7 @@ melee.gg does have a documented API (see `melee-integration-technical.md`), but 
 
 Overall league standings are a sum of a player's points across every stage they've attended (see `league-scoring-technical.md` for the scoring formula itself). Computing this correctly requires access to every stage's placement data at once. If stage data lived only in melee.gg, computing standings on every request would mean: fetch N stages live from melee.gg, recompute, on every single page view, for every visitor. That's slow, expensive in outbound calls, and fragile (one melee.gg hiccup breaks standings for everyone).
 
-With stage data persisted locally, standings computation becomes a query over our own rows — either computed on-the-fly per request (cheap once data is local: a `GROUP BY player` sum over a `Placement` table with a few hundred rows, easily sub-millisecond) or cached in a small aggregate table refreshed after each ingestion. Given this project's scale, on-the-fly recomputation from persisted data is sufficient; a separate materialized/cached standings table is not required for MVP but is a natural future optimization if the number of stages grows very large (not expected).
+With stage data persisted locally, standings computation becomes a query over our own rows — either computed on-the-fly per request (cheap once data is local: a `GROUP BY player` sum over a `StagePlacement` table with a few hundred rows, easily sub-millisecond) or cached in a small aggregate table refreshed after each ingestion. Given this project's scale, on-the-fly recomputation from persisted data is sufficient; a separate materialized/cached standings table is not required for MVP but is a natural future optimization if the number of stages grows very large (not expected).
 
 ### 4. Traffic is tiny — keep infrastructure minimal
 
@@ -40,7 +40,7 @@ Either path writes through the same `MeleeIntegrationService` ingestion logic an
 
 ## Schema sketch (Prisma)
 
-This is the canonical schema; individual module docs (`tournament-stage-technical.md`, `player-technical.md`, `decklists-technical.md`, `melee-integration-technical.md`) describe how their module reads/writes these models but do not redefine them.
+`League`, `Season`, `AdminUser`, `AdminLeagueAccess`, `RefreshToken`, `AuditLog`, `Decklist`, and `DecklistEntry` are canonical here. **`Stage`, `StagePlacement`, `StagePairing`, `StageSyncLog`, `Player`, `PlayerAlias`, and `UnresolvedPlayerMatch` are canonical in their own module docs instead** (`tournament-stage-technical.md`, `league-scoring-technical.md`, `player-technical.md` — see the note after `AuditLog` below for why, revised 2026-08-26/issue #82). Every other module doc describes how it reads/writes whichever of these models it touches, but does not redefine them.
 
 ```prisma
 // schema.prisma (sketch — field types illustrative, not exhaustive)
@@ -148,50 +148,20 @@ model AuditLog {
   @@index([targetType, targetId])
 }
 
-model Stage {
-  id            String       @id @default(cuid())
-  seasonId      String                          // which season this stage's results count toward
-  season        Season       @relation(fields: [seasonId], references: [id])
-  name          String                          // e.g. "Tappa 3 - Modern"
-  meleeEventId  String       @unique             // melee.gg tournament id, for idempotent re-sync
-  format        String                           // e.g. "Modern", "Pioneer"
-  isFinal       Boolean      @default(false)     // true for the season-ending final tournament — ingested like any stage, but excluded from league-scoring aggregation (see league-scoring-technical.md)
-  excluded      Boolean      @default(false)     // admin safety-net: hides this stage from standings/display without deleting ingested data — for a tournament that auto-synced but shouldn't have (e.g. a test event in the same melee.gg org). Distinct from isFinal: excluded stages count toward nothing, isFinal stages are shown but don't count toward league points.
-  playerCount   Int                              // N in the scoring formula — snapshotted at close
-  closedAt      DateTime                         // when the stage concluded on melee.gg
-  ingestedAt    DateTime     @default(now())     // when we snapshotted it
-  placements    Placement[]
-  decklists     Decklist[]
-
-  @@index([closedAt])
-  @@index([seasonId])
-}
-
-model Player {
-  id            String       @id @default(cuid())
-  displayName   String
-  meleeProfileId String?     @unique             // melee.gg profile id, if resolvable, for cross-stage matching
-  mergedIntoId  String?                          // set when an admin merges this (duplicate) player into another — see the player-merge note below. A tombstone, not a delete: preserves the audit trail per this doc's historical-integrity principle.
-  mergedInto    Player?      @relation("PlayerMerge", fields: [mergedIntoId], references: [id])
-  mergedFrom    Player[]     @relation("PlayerMerge")
-  createdAt     DateTime     @default(now())
-  placements    Placement[]
-  decklists     Decklist[]
-}
-
-model Placement {
-  id            String       @id @default(cuid())
-  stageId       String
-  stage         Stage        @relation(fields: [stageId], references: [id])
-  playerId      String
-  player        Player       @relation(fields: [playerId], references: [id])
-  finalRank     Int                              // 1-indexed placement within the stage
-  points        Int                              // computed via ScoringModule at ingestion time, persisted
-  createdAt     DateTime     @default(now())
-
-  @@unique([stageId, playerId])
-  @@index([playerId])
-}
+// Stage, StagePlacement (the actual model name — see note below), StagePairing,
+// StageSyncLog, and Player/PlayerAlias/UnresolvedPlayerMatch are NOT redefined
+// here — they're owned by tournament-stage-technical.md, league-scoring-technical.md,
+// and player-technical.md respectively, per this doc's own rule that module docs
+// describe how they read/write shared models but don't redefine them.
+//
+// Revised 2026-08-26 (issue #82): this used to include local sketches of
+// Stage/Placement/Player that had drifted from those module docs' real,
+// richer definitions (different field names — meleeEventId vs. meleeTournamentId,
+// Placement vs. StagePlacement — and models like StagePairing/StageSyncLog/
+// PlayerAlias/UnresolvedPlayerMatch that only ever existed in the module docs).
+// The actual implemented `prisma/schema.prisma` follows the module docs; this
+// file no longer keeps a second, competing sketch that can drift out of sync —
+// see those docs' own `## 1. Data model` sections for the real field lists.
 
 model Decklist {
   id            String       @id @default(cuid())
@@ -228,16 +198,16 @@ enum MatchConfidence {
 ```
 
 Notes:
-- `Placement.points` is persisted (not recomputed on every standings request) so that if `BASE_POINTS` config changes in the future, historical placements are unaffected — only newly-ingested stages use the new value. This preserves historical integrity in the same spirit as reason #1 above.
-- `Stage.playerCount` is snapshotted at ingestion (not derived by counting `Placement` rows live) so the scoring formula's `N` is fixed to what it was when the stage closed, even if `Placement` rows were ever corrected later.
+- `StagePlacement.points` is persisted (not recomputed on every standings request) so that if `BASE_POINTS` config changes in the future, historical placements are unaffected — only newly-ingested stages use the new value. This preserves historical integrity in the same spirit as reason #1 above. Full `StagePlacement` field list and the denormalized `fieldSize` reasoning: `league-scoring-technical.md` §2.
+- `Stage.playerCount` is snapshotted at ingestion (not derived by counting `StagePlacement` rows live) so the scoring formula's `N` is fixed to what it was when the stage closed, even if placement rows were ever corrected later. Full `Stage` field list and lifecycle: `tournament-stage-technical.md`.
 - `DecklistEntry.scryfallCardId` stores Scryfall's own card id once resolved, but is not a Postgres foreign key — the card data it identifies lives in Redis, not this database, and may be evicted/re-resolved independently (see `scryfall-integration-technical.md`).
 - `DecklistEntry.matchConfidence` (added 2026-08-26, resolving issue #75): `resolved: Boolean` alone only captures matched-vs-not, not *how confidently* — `matchConfidence` carries that signal (exact name match vs. a fuzzy Scryfall match worth flagging to the user vs. genuinely unmatched). `resolved = (matchConfidence !== 'UNMATCHED')` always holds; the two fields aren't independent, but `resolved` is kept as its own boolean since most read paths (e.g. "does this entry have a card image") only care about that, not the finer distinction — `decklists-technical.md` §5 is the one place `matchConfidence` itself is surfaced to the API.
 - **`Season`** (added 2026-08-26, per the corner-case review): supports running a fresh league each year rather than one league forever. Every `Stage` — including the season-ending final (`isFinal = true`) — belongs to exactly one `Season`. Standings aggregation (`league-scoring-technical.md`) is scoped per `Season`, not computed globally across all seasons ever played.
-- **`Stage.isFinal`**: distinguishes the season-ending final tournament from regular stages. It's ingested through the same melee.gg sync pipeline as any other stage, but `league-scoring-technical.md`'s standings aggregation explicitly excludes `isFinal = true` stages — the final's own results are tracked and displayed (a "league champion" callout) but never feed back into league points, since qualification for the final is itself derived from the regular-season standings.
+- **`Stage.isFinal`**: distinguishes the season-ending final tournament from regular stages. It's ingested through the same melee.gg sync pipeline as any other stage, but `league-scoring-technical.md`'s standings aggregation explicitly excludes `isFinal = true` stages — the final's own results are tracked and displayed (a "league champion" callout) but never feed back into league points, since qualification for the final is itself derived from the regular-season standings. See `tournament-stage-technical.md` §1a/§1b for `isFinal` and the related `excluded` admin safety-net flag.
 - **`DecklistVisibilityMode`**: scoped **per `Season`**, not global — a season-level admin can choose to make decklists visible immediately for an archived/past season while a live season still defaults to hiding them until each stage closes. The default (`HIDDEN_UNTIL_STAGE_CLOSE`) avoids meta-leaking mid-event; see `decklists-technical.md` for enforcement details. This is the "configurable setting" from the admin panel — flipping it is one of the actions gated behind admin login (see `security-technical.md`).
 - **`AdminUser`**: backs the admin login system (see `security-technical.md`). Replaces the earlier single-shared-secret bearer token — actions gated behind it include triggering a melee.gg sync, resolving an `UnresolvedPlayerMatch`, toggling `Season.decklistVisibilityMode`, and (2026-08-26 second corner-case review) managing seasons, correcting ingested data, merging players, and — `SUPER_ADMIN` only — creating admins and granting `AdminLeagueAccess`.
 - **`League`** (added 2026-08-26, second corner-case review): the platform's top-level tenant concept — the project moved from "one league, one melee.gg org, forever" to supporting multiple concurrent leagues, each backed by its own org and its own encrypted credentials. Every `Season` belongs to exactly one `League`; `AdminLeagueAccess` scopes `ORGANIZER`/`MODERATOR` admins to specific leagues. `SUPER_ADMIN` bypasses `AdminLeagueAccess` entirely (implicit access to every league) rather than holding a row per league.
-- **Player merge**: an admin action (not a background job) for when the same real person ends up as two `Player` rows across stages (e.g. a melee.gg profile-id mismatch). Reassigns the duplicate's `Placement`/`Decklist` rows to the canonical `Player`, then sets `mergedIntoId` on the duplicate rather than deleting it — the duplicate row survives as a tombstone so standings/decklist history stays queryable and auditable (an `AuditLog` entry is written for every merge). Application code reading `Placement`/`Decklist` should already be reading from the canonical player post-merge since the rows themselves are reassigned; `mergedIntoId` exists for admin-UI/audit purposes, not as a redirect that read paths need to follow.
+- **Player merge** (`Player.mergedIntoId`/`mergedInto`/`mergedFrom`, defined on the canonical `Player` model in `player-technical.md` §1, not duplicated here): an admin action (not a background job) for when the same real person ends up as two `Player` rows across stages (e.g. a melee.gg profile-id mismatch). Reassigns the duplicate's `StagePlacement`/`Decklist` rows to the canonical `Player`, then sets `mergedIntoId` on the duplicate rather than deleting it — the duplicate row survives as a tombstone so standings/decklist history stays queryable and auditable (an `AuditLog` entry is written for every merge). Application code reading `StagePlacement`/`Decklist` should already be reading from the canonical player post-merge since the rows themselves are reassigned; `mergedIntoId` exists for admin-UI/audit purposes, not as a redirect that read paths need to follow. Full merge-endpoint behavior: `player-technical.md` §8.
 - **`RefreshToken`** / **`AuditLog`**: back the JWT refresh-token rotation flow and the admin audit log respectively — see `security-technical.md` for the full auth flow and what gets logged.
 
 ## Migrations
@@ -248,7 +218,9 @@ Managed via Prisma Migrate (`prisma migrate dev` locally, `prisma migrate deploy
 
 - `hosting-deployment-be-technical.md` — Neon as the Postgres host, and why (vs. Render's own Postgres); Upstash Redis as the Scryfall cache host.
 - `scryfall-integration-technical.md` — the Redis cache key scheme, TTL, and fallback behavior for resolving `DecklistEntry.scryfallCardId`.
-- `melee-integration-technical.md` — the ingestion flow that populates `League`, `Stage`, `Player`, `Placement`, `Decklist`, `DecklistEntry`, including per-league auto-sync and the `Stage.excluded` safety net.
-- `league-scoring-technical.md` — the formula used to compute `Placement.points` at ingestion time, and standings aggregation scoped per `Season` while excluding `isFinal` and `excluded` stages.
-- `tournament-stage-technical.md`, `decklists-technical.md`, `player-technical.md` — module-level API/behavior built on top of `Stage`/`Decklist`/`Player` respectively.
+- `melee-integration-technical.md` — the ingestion flow that populates `League`, `Stage`, `Player`, `StagePlacement`, `Decklist`, `DecklistEntry`, including per-league auto-sync and the `Stage.excluded` safety net.
+- `league-scoring-technical.md` — canonical `StagePlacement` model, the formula used to compute `StagePlacement.points` at ingestion time, and standings aggregation scoped per `Season` while excluding `isFinal` and `excluded` stages.
+- `tournament-stage-technical.md` — canonical `Stage`/`StagePairing`/`StageSyncLog` models and lifecycle.
+- `player-technical.md` — canonical `Player`/`PlayerAlias`/`UnresolvedPlayerMatch` models, name reconciliation, and the player-merge action.
+- `decklists-technical.md` — module-level API/behavior built on top of the `Decklist`/`DecklistEntry` models above.
 - `security-technical.md` — the full `AdminUser` auth flow (JWT + refresh token rotation, `SUPER_ADMIN` seeding, per-league `AdminLeagueAccess`, encryption of `League` melee.gg credentials, login lockout/rate-limiting, audit logging) and which actions its guards protect.

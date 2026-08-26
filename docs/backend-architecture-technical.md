@@ -120,7 +120,7 @@ MeleeIntegrationModule ──▶ StagesModule ──▶ ScoringModule
                  ScryfallModule
 ```
 
-- `MeleeIntegrationModule` orchestrates ingestion: on sync, it creates/updates `Stage`, `Placement`, `Player`, and `Decklist`/`DecklistEntry` rows, so it depends on `StagesModule`, `PlayersModule`, and `DecklistsModule`'s services (each module exports the service methods ingestion needs, e.g. `StagesService.upsertStageResult(...)`). It also depends on `LeaguesModule` to resolve a `League`'s `meleeOrgId` and decrypted credentials before a sync run.
+- `MeleeIntegrationModule` orchestrates ingestion: on sync, it creates/updates `Stage`, `StagePlacement`, `Player`, and `Decklist`/`DecklistEntry` rows, so it depends on `StagesModule`, `PlayersModule`, and `DecklistsModule`'s services (each module exports the service methods ingestion needs, e.g. `StagesService.upsertStageResult(...)`). It also depends on `LeaguesModule` to resolve a `League`'s `meleeOrgId` and decrypted credentials before a sync run.
 - `DecklistsModule` depends on `ScryfallModule` to resolve each `DecklistEntry`'s card data at ingestion time.
 - `StagesModule` and `PlayersModule` depend on `ScoringModule` to compute per-stage points and aggregate league standings.
 - `ScoringModule` and `ScryfallModule` are "leaf" modules — they depend only on `PrismaModule`, not on other feature modules — so they're easy to unit test and reuse.

@@ -16,7 +16,7 @@ In practice this means:
 
 ## How the season works
 
-- The league runs across multiple stages over a season, and a fresh season starts each year — standings are always computed within one season, not accumulated forever across every season ever played.
+- Standings are computed **within one league's one season at a time** — the platform can run several leagues concurrently (see `data-model-overview.md`), each with its own fresh season each year, and a player's standing in one league's season never mixes with another league's, or with a different season of the same league.
 - A player accumulates points from **every regular stage they attend within that season** — no stage is thrown out or discounted, even a player's worst result still counts.
 - At the end of the season, players are ranked by their **total accumulated points** across all regular stages in that season.
 - The **top 8 players** in that ranking qualify for the season-ending final tournament.
@@ -24,6 +24,10 @@ In practice this means:
 ## The final tournament doesn't add points
 
 The season-ending final (the Top-8 bracket) is played, tracked, and displayed on the site — including a "league champion" callout — but its results are **display-only**: they never get added into anyone's season point total. The final is the reward for a strong regular season, not one more stage to score; scoring it would be circular, since qualification for it is decided *by* the regular-season standings in the first place. See `tournament-stage-overview.md` for how the final is modeled.
+
+## A stage an admin has excluded doesn't count either
+
+Since every tournament under a league's melee.gg organization is now pulled in automatically as a stage (see `melee-integration-overview.md`), an admin occasionally needs to correct a wrongly-included one — a test event, say. Marking that stage excluded removes it from standings the same way the season-ending final is excluded: its results stay recorded, but nothing about it adds to anyone's point total or stage count. See `tournament-stage-overview.md` for how exclusion works.
 
 ## Breaking ties for the Top 8
 

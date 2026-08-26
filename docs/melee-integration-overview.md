@@ -4,6 +4,17 @@
 
 melee.gg is the third-party platform the league actually plays its tournaments on. Prem League Tracker doesn't organize tournaments itself — it reads back tournament info, standings, decklists, and player rosters from melee.gg and turns them into the league's own historical record. This document explains, at a conceptual level, how that connection works.
 
+## Sync is per-league now
+
+**Update (2026-08-26, second corner-case review)**: the platform can run several leagues at once (see `data-model-overview.md`), and each league has its own melee.gg organization and its own melee.gg API credentials, kept encrypted and never shared between leagues. Syncing one league's tournaments never touches or exposes another league's data, even if both leagues happen to have real credentials configured at the same time.
+
+Two things changed about *when* and *what* gets synced:
+
+- **No more picking which tournaments count.** Previously this document assumed an admin would choose which melee.gg tournaments to link as stages. That step is gone: every tournament that exists under a league's melee.gg organization is automatically pulled in as a stage the next time that league syncs — nothing to opt in.
+- **Sync happens automatically every day, on top of the existing manual trigger.** A background job checks every league once a day for newly-closed tournaments and ingests them without anyone needing to remember to click sync. An admin can still trigger a sync for their league on demand (e.g. right after a tournament wraps up, without waiting for the next day's automatic run) — both exist side by side.
+
+Because inclusion is now automatic, there's one new admin safety net: if a tournament gets swept in that shouldn't count (a test event created in the same melee.gg organization, say), an admin can mark that stage **excluded** — it disappears from standings and public listings, but nothing about it is deleted, and un-excluding it later needs no re-sync. This is a correction an admin makes *after* seeing something wrongly included, not a gate they have to clear *before* anything gets included.
+
 ## melee.gg has a real, documented API — this isn't scraping
 
 **Update (2026-08-26)**: earlier drafts of this document assumed melee.gg had to be treated like any random website — scraped defensively, expecting its page structure to shift without warning. That assumption was wrong. melee.gg publishes a real, documented REST API (a full Swagger specification is even publicly browsable, no login required, at `melee.gg/swagger/ui/index`), and access to actually *call* it is granted properly: an organization requests API credentials (a client ID and secret) by emailing melee.gg directly, after the tournament-organizing party authorizes it. Those credentials are used as a username/password pair (HTTP Basic authentication) on every request. Prem League Tracker integrates against that documented API, not by parsing HTML.
@@ -12,7 +23,7 @@ This is a meaningfully different, sturdier foundation than "treat melee.gg like 
 
 ## Getting access is a real, separate blocker
 
-Using melee.gg's API requires a client ID and secret, which melee.gg only issues after the organization running the tournaments authorizes the request. That authorization, plus emailing melee.gg to actually request the credentials, hasn't happened yet as of this writing — it depends on someone outside this project (the tournament organizer) and on melee.gg's own support turnaround, so there's no fixed timeline. This is tracked as its own external blocker, not something this document tries to resolve.
+Using melee.gg's API requires a client ID and secret, which melee.gg only issues after the organization running the tournaments authorizes the request. That authorization, plus emailing melee.gg to actually request the credentials, hasn't happened yet as of this writing for Mattia's own league — it depends on someone outside this project (the tournament organizer) and on melee.gg's own support turnaround, so there's no fixed timeline. This is tracked as its own external blocker, not something this document tries to resolve. Because credentials are now a per-league concern (see above), this blocker is specific to whichever league hasn't obtained its credentials yet — a new league joining the platform later goes through the same request process independently, and other leagues aren't affected by any one league's credentials still being pending.
 
 Importantly, that blocker doesn't stop backend development: the integration is built and tested against realistic sample data (fixtures) standing in for the real API responses, so the rest of the system — ingestion, player matching, decklists, scoring — can be built and exercised end-to-end today. Swapping fixtures for the real API later is a configuration change, not a rewrite.
 

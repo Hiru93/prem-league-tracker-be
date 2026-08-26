@@ -2,7 +2,9 @@
 
 ## Status (updated 2026-08-26)
 
-This document previously assumed melee.gg had no documented public API and had to be treated as a fragile scrape target (HTML parsing, structural-change detection, defensive per-field fallbacks). **That premise was wrong and this doc has been rewritten around the corrected one** — and has now been updated a second time with the *real* API contract.
+This document previously assumed melee.gg had no documented public API and had to be treated as a fragile scrape target (HTML parsing, structural-change detection, defensive per-field fallbacks). **That premise was wrong and this doc has been rewritten around the corrected one** — and has now been updated a second time with the *real* API contract, and a third time (second corner-case review) for the **per-League, auto-include, dual-trigger** sync model described below.
+
+**Per-League sync (2026-08-26, second corner-case review)**: the platform now supports multiple concurrent leagues (see `data-model-technical.md`'s `League` model), each backed by its **own** melee.gg organization and its own melee.gg API credentials. Everything in this document that previously assumed a single global `MELEE_CLIENT_ID`/`MELEE_CLIENT_SECRET` pair now applies **per `League` row** instead — see §1a. Sync is also no longer solely admin-triggered: a daily scheduled job checks every league for newly-closed tournaments in addition to the existing manual admin-triggered sync (§2a), and every tournament found under a league's org is auto-included as a `Stage` with no manual "pick which tournaments count" step (§2b). An admin can mark a wrongly-auto-included stage `excluded` after the fact (§2c) — a safety net, not a pre-sync gate.
 
 melee.gg publishes a real, public Swagger spec at `https://melee.gg/swagger/docs/v0.3.64.163` (linked from the browsable UI at `https://melee.gg/swagger/ui/index`), viewable **without any credentials** — no login wall on the documentation itself. It defines 25 endpoints across `TournamentApi`, `TournamentStandingApi`, `TournamentDecklistApi`, `TournamentPlayerApi`, `TournamentMatchApi`, `TournamentTeamApi` (plus two tags unrelated to this project, `AdminReportsApi` and `CyberpunkOrganizationApi`). §3 below lists the real endpoints, replacing the earlier conceptual/guessed list.
 
@@ -12,7 +14,7 @@ melee.gg publishes a real, public Swagger spec at `https://melee.gg/swagger/docs
 
 **Active external blocker, not this doc's concern to track**: obtaining real credentials requires (1) the organizing party for the league's tournaments authorizing melee.gg to grant API access, then (2) emailing `contact@melee.gg` to request them. Mattia has not completed this yet, and the timeline is outside our control (tracked as its own issue). Viewing the Swagger spec required none of that — but *calling* any endpoint with real data still does. This doc describes the **target design** to build against regardless of whether credentials have arrived — see §5 (mock mode) for how development proceeds in the meantime.
 
-Related: `tournament-stage-technical.md` (Stage/StagePlacement/StagePairing targets, including `isFinal`/`seasonId`), `player-technical.md` (Player/PlayerAlias/UnresolvedPlayerMatch targets), `decklists-technical.md` (Decklist/DecklistEntry targets, visibility), `league-scoring-technical.md` (what depends on placements being correct), `security-technical.md` (the admin login gating a manually-triggered sync).
+Related: `data-model-technical.md` (`League`, `Stage.excluded`), `tournament-stage-technical.md` (Stage/StagePlacement/StagePairing targets, including `isFinal`/`seasonId`), `player-technical.md` (Player/PlayerAlias/UnresolvedPlayerMatch targets), `decklists-technical.md` (Decklist/DecklistEntry targets, visibility), `league-scoring-technical.md` (what depends on placements being correct), `security-technical.md` (per-League credential encryption/decryption, admin login gating manual sync).
 
 ## 1. Authentication
 
@@ -30,18 +32,37 @@ function buildAuthHeader(creds: MeleeCredentials): string {
 }
 ```
 
-- `MELEE_CLIENT_ID` and `MELEE_CLIENT_SECRET` are read exclusively from environment variables via `@nestjs/config` — never hardcoded, never logged (per `security-technical.md`'s secrets-handling rules, which apply here without exception) — and used directly as the Basic-auth username/password on every request. There is no separate auth/token service: no `MeleeAuthService`, no cached access token, no refresh logic. This is a meaningful simplification versus the previously-assumed OAuth2 client-credentials flow.
-- If `MELEE_CLIENT_ID`/`MELEE_CLIENT_SECRET` are unset (the expected state until the external blocker above resolves), the module falls back to mock mode — see §5 — rather than failing to boot. This lets the rest of the backend (and its tests) run without real credentials.
-- A failed-auth response (per the Status section: observed as `HTTP 400` with `Message: "Could not authenticate user."`, not a `401`) should be treated as a fatal, non-retryable configuration error, not a transient failure — see §4.2's non-retryable list and §6.
+- Credentials are no longer a single global env-var pair. Each `League` row stores its own `meleeClientIdEncrypted`/`meleeClientSecretEncrypted` (AES-256-GCM ciphertext — see §1a and `security-technical.md`'s "League credential encryption" section for the encryption scheme itself, which this doc doesn't re-derive). There is still no separate auth/token service: no `MeleeAuthService`, no cached access token, no refresh logic — that simplification versus an OAuth2 client-credentials flow still holds, it just now happens once per `League` rather than once globally.
+- If a `League` has no melee.gg credentials configured yet (the expected state for a newly-created league until its credentials are set, or globally until the external blocker in the Status section resolves), sync for that league falls back to mock mode — see §5 — rather than failing to boot or failing the whole app.
+- A failed-auth response (per the Status section: observed as `HTTP 400` with `Message: "Could not authenticate user."`, not a `401`) should be treated as a fatal, non-retryable configuration error for that league's credentials specifically, not a transient failure and not something that should affect any other league's sync — see §4.2's non-retryable list and §6.
+
+## 1a. Per-League credentials
+
+```ts
+// melee-credentials.provider.ts (sketch)
+async function getMeleeCredentialsForLeague(prisma: PrismaClient, leagueId: string): Promise<MeleeCredentials> {
+  const league = await prisma.league.findUniqueOrThrow({ where: { id: leagueId } });
+  return {
+    username: decrypt(league.meleeClientIdEncrypted),     // decrypt() is the shared helper from security-technical.md's
+    password: decrypt(league.meleeClientSecretEncrypted), // "League credential encryption" section — not reimplemented here
+  };
+}
+```
+
+- Decryption happens **only at point of use** — immediately before building the Basic-auth header for a call to melee.gg's API — never earlier, never cached in plaintext, never logged or returned in any API response (the admin panel only ever shows a masked placeholder for a league's configured credentials, per `security-technical.md`).
+- `League.meleeOrgId` (see `data-model-technical.md`) identifies which melee.gg organization's tournaments this league syncs from; it's the scoping value passed to `GET /api/tournament/list` (§3) to restrict results to this league's own tournaments, so one league's sync run can never pull in another league's data even if both happen to be configured against melee.gg at the same time.
+- A sync run is always for exactly one `League` — `MeleeSyncService`'s entry point takes a `leagueId`, resolves that league's org id and decrypted credentials once at the start of the run, and uses them for every request made during that run.
 
 ## 2. Module shape (NestJS)
 
 ```
 src/melee-integration/
-  melee-client.service.ts       // typed HTTP client against melee.gg's documented REST API (Basic auth header on every call, no auth service needed)
+  melee-client.service.ts       // typed HTTP client against melee.gg's documented REST API (Basic auth header built from a given League's decrypted credentials, no auth service needed)
   melee-mock-client.service.ts  // fixture-backed implementation of the same client interface, for mock mode
-  melee-sync.service.ts         // orchestrates a stage sync, maps raw API responses -> domain entities
-  melee-sync.controller.ts      // admin-triggered sync endpoint (see tournament-stage-technical.md §2), guarded per security-technical.md
+  melee-sync.service.ts         // orchestrates a sync run for one League: lists its org's tournaments, auto-includes new ones as Stage rows, maps raw API responses -> domain entities
+  melee-sync.controller.ts      // admin-triggered manual sync endpoint, POST /admin/leagues/:leagueId/sync (see §2a), guarded per security-technical.md
+  melee-sync.scheduler.ts       // @nestjs/schedule cron job, once/day, iterates every League and triggers MeleeSyncService for each (see §2a)
+  melee-credentials.provider.ts // resolves + decrypts a League's melee.gg credentials at point of use (see §1a)
   dto/
     raw-tournament.dto.ts
     raw-standings-row.dto.ts
@@ -55,7 +76,64 @@ src/melee-integration/
   melee-integration.module.ts
 ```
 
-`MeleeSyncService` depends on an injected `MeleeClient` interface; `MeleeClientService` (real API) and `MeleeMockClientService` (fixtures) are two interchangeable implementations of it, selected at module-init time per §5. Nothing else in the codebase talks to melee.gg directly.
+`MeleeSyncService` depends on an injected `MeleeClient` interface; `MeleeClientService` (real API, credentialed per-League via §1a) and `MeleeMockClientService` (fixtures) are two interchangeable implementations of it, selected per sync run based on whether the target `League` has usable credentials (see §5). Nothing else in the codebase talks to melee.gg directly.
+
+## 2a. Automatic + manual sync, both
+
+Per the second corner-case review, ingestion is no longer solely admin-triggered — both paths are live simultaneously and write through the same `MeleeSyncService` logic, so a stage ends up identical regardless of which path ingested it:
+
+- **Scheduled (automatic)**: a `@nestjs/schedule` cron job (`melee-sync.scheduler.ts`) runs **once per day** and, for every `League` in the system, calls `MeleeSyncService.syncLeague(leagueId)`. This is what catches a tournament that closed on melee.gg without anyone remembering to trigger a manual sync — the normal, expected way most stages get ingested day to day.
+- **Manual (admin-triggered)**: an admin can still trigger a sync for a specific league on demand —
+
+  ```
+  POST /admin/leagues/:leagueId/sync
+  ```
+
+  Guarded by `AdminAuthGuard` + `LeagueAccessGuard` (see `security-technical.md`) — the caller must be `SUPER_ADMIN` or hold `AdminLeagueAccess` for this `leagueId`. Useful right after a stage closes, without waiting for the next scheduled run, or to retry a league whose previous sync failed.
+
+  ```ts
+  interface SyncLeagueResponse {
+    leagueId: string;
+    stagesCreated: number;    // newly auto-included tournaments this run
+    stagesUpdated: number;    // already-known stages whose standings/decklists were refreshed
+    syncLogIds: string[];
+  }
+  ```
+
+- Both paths call `MeleeSyncService.syncLeague(leagueId, triggeredBy)`, where `triggeredBy` is `"scheduled"` for the cron path and `"manual:<adminEmail>"` for the admin-triggered path — recorded on each `StageSyncLog` row (see `tournament-stage-technical.md`) so it's always visible after the fact whether a given sync was automatic or manually requested. A manual sync doesn't disable or replace the scheduled job for that league — the two coexist, and a league that's synced manually today still gets checked again by tomorrow's scheduled run.
+
+## 2b. Auto-include: every tournament under the org becomes a Stage
+
+There is no admin step to pick which tournaments count. On each sync run for a `League`, `MeleeSyncService`:
+
+1. Calls `GET /api/tournament/list` scoped to that league's `meleeOrgId` (§3).
+2. For every tournament returned that doesn't yet have a matching `Stage.meleeEventId`, creates a new `Stage` row for it (attached to that league's currently-active `Season`, per `Season.isActive`) — this is the auto-include: showing up under the org is sufficient, there's no separate "approve this tournament" action anywhere in the admin flow.
+3. For every tournament that already has a matching `Stage`, re-fetches and refreshes its standings/decklists if the tournament's status has changed since the last sync (e.g. it has since closed).
+
+This deliberately trades "an admin might occasionally get an unwanted tournament synced in" for "no admin ever has to remember to manually add a stage" — the corner-case review's judgment was that the latter's day-to-day convenience outweighs the former's occasional cleanup, especially since §2c below makes the cleanup cheap and non-destructive.
+
+## 2c. `Stage.excluded` — the safety net, not a gate
+
+Because inclusion is automatic, the one place admin judgment is still needed is *after* the fact: an admin can mark an already-synced `Stage` as `excluded = true` (see `data-model-technical.md`) to correct a tournament that auto-synced but shouldn't count — the canonical example is a test event created in the same melee.gg org as the league's real tournaments.
+
+```
+PATCH /admin/leagues/:leagueId/stages/:stageId/excluded
+```
+
+```ts
+interface SetStageExcludedRequest {
+  excluded: boolean; // true to hide it, false to restore it
+}
+```
+
+Guarded by `AdminAuthGuard` + `LeagueAccessGuard`, same as the manual sync endpoint. Setting `excluded = true`:
+
+- Hides the stage from public standings and stage listings (see `tournament-stage-technical.md` for exactly how listings/detail routes treat it, and `league-scoring-technical.md` for standings aggregation).
+- **Does not** delete any ingested data — `StagePlacement`/`Decklist`/`StagePairing` rows for that stage stay in the database untouched, and re-toggling `excluded` back to `false` restores full visibility with nothing to re-sync.
+- **Does not** touch melee.gg in any way — this is purely a local flag, not an un-invite or a deletion on the melee.gg side.
+- Writes an `AuditLog` entry (`STAGE_EXCLUDE` / `STAGE_INCLUDE`, per `security-technical.md`).
+
+This is explicitly a **post-sync correction**, not a pre-sync approval gate — there is no state a `Stage` passes through before `excluded` is available to set; a tournament is auto-included first, and can be excluded after, if ever needed.
 
 ## 3. Real endpoints (from the public Swagger spec)
 
@@ -85,8 +163,8 @@ interface ApiResult<T> {
 
 | Endpoint | ID type | Notes |
 |---|---|---|
-| `GET /api/tournament/list` | — | Filters: `startDateFrom`, `startDateTo`, `tournamentId`, `lastUpdatedDate`. "Lists tournaments accessible to the authenticated staff member." |
-| `GET /api/tournament/{id}` | tournament id: `int64` | Single tournament detail — maps to `Stage` metadata (`tournament-stage-technical.md`); `isFinal` is set by our admin at link time, never read from melee.gg. |
+| `GET /api/tournament/list` | — | Filters: `startDateFrom`, `startDateTo`, `tournamentId`, `lastUpdatedDate`. "Lists tournaments accessible to the authenticated staff member" — since a sync run authenticates with one `League`'s own credentials (§1a), this naturally scopes results to that league's org without needing an explicit org-id filter param; this is the endpoint §2b's auto-include walks on every sync run to discover new tournaments. |
+| `GET /api/tournament/{id}` | tournament id: `int64` | Single tournament detail — maps to `Stage` metadata (`tournament-stage-technical.md`); `isFinal` is set by our admin (via a request field on the manual sync/link flow, see `tournament-stage-technical.md` §2), never read from melee.gg. `excluded` is likewise never read from melee.gg — it's a purely local admin flag, see §2c. |
 | `GET /api/standing/list/current/{id}` | tournament id: `int64` | Current standings for a tournament — primary source for `StagePlacement` (`league-scoring-technical.md`). |
 | `GET /api/standing/list/round/{id}` | round id: `int64` | Standings as of a specific round — useful for a `Stage` still `IN_PROGRESS`. |
 | `GET /api/standing/{id}` | team id: `int64` | "Most current standings for a specific **team**" — only relevant if a tournament is team-based; the league's stages are assumed individual (see `player-technical.md`), so likely unused, kept for completeness. |
@@ -180,35 +258,33 @@ async function fetchWithRetry(fn: () => Promise<Response>, cfg: RetryConfig): Pr
 ```
 
 - **Retryable**: network errors, `429 Too Many Requests`, `5xx` — the standard set of transient failures for any real API, ours included.
-- **Not retryable (fail fast)**: `404 Not Found` (tournament id doesn't exist / wrong id), `400` with an auth-failure message (per Status — credentials missing/invalid; since Basic auth has no token to refresh, this just fails straight to the admin), `403` (credentials valid but not authorized for this resource — needs human attention, retrying won't help).
+- **Not retryable (fail fast)**: `404 Not Found` (tournament id doesn't exist / wrong id), `400` with an auth-failure message (per Status — credentials missing/invalid for the `League` being synced; since Basic auth has no token to refresh, this just fails straight to the admin), `403` (credentials valid but not authorized for this resource — needs human attention, retrying won't help).
+- **Per-League isolation**: since the scheduled job (§2a) iterates every `League` in one daily run, a failure syncing one league (bad/missing credentials, melee.gg outage scoped to that org, etc.) is caught and logged against that league's own `StageSyncLog`/run record and does **not** abort or skip the remaining leagues in that day's run — each league's sync is independent, so one misconfigured league can't silently starve every other league of its daily sync.
 - A `429` response, if it carries a `Retry-After` header, has that value respected as a floor on the backoff delay rather than the computed exponential value, when present — standard behavior for a rate-limited REST API.
 
 Note: §4.3 (token-expiry handling) from the previous version of this doc no longer applies — Basic auth has no token to expire, so there's nothing to refresh mid-sync.
 
 ## 5. Mock mode (fixture-based)
 
-Because real client credentials are an active external blocker with an unknown timeline (see Status above), `MeleeClientService` is not the only implementation of the client interface development runs against.
+Because real client credentials are an active external blocker with an unknown timeline (see Status above), `MeleeClientService` is not the only implementation of the client interface development runs against. Mock-mode selection now happens **per sync run, per `League`**, rather than once globally at module boot, since each league independently has or lacks usable credentials:
 
 ```ts
-// melee-integration.module.ts (sketch)
-const useMock = !process.env.MELEE_CLIENT_ID || !process.env.MELEE_CLIENT_SECRET || process.env.MELEE_MOCK_MODE === 'true';
-
-@Module({
-  providers: [
-    {
-      provide: MELEE_CLIENT,
-      useClass: useMock ? MeleeMockClientService : MeleeClientService,
-    },
-    MeleeSyncService,
-  ],
-})
-export class MeleeIntegrationModule {}
+// melee-sync.service.ts (sketch)
+async function getClientForLeague(leagueId: string): Promise<MeleeClient> {
+  const league = await prisma.league.findUniqueOrThrow({ where: { id: leagueId } });
+  const hasCredentials = Boolean(league.meleeClientIdEncrypted && league.meleeClientSecretEncrypted);
+  if (!hasCredentials || process.env.MELEE_MOCK_MODE === 'true') {
+    return mockClient; // MeleeMockClientService
+  }
+  const credentials = await getMeleeCredentialsForLeague(prisma, leagueId); // §1a, decrypted here
+  return realClient.withCredentials(credentials); // MeleeClientService
+}
 ```
 
-- `MeleeMockClientService` implements the same client interface (`getTournamentInfo`, `getStandings`, `getRoster`, `getDecklists`) but reads from static JSON fixtures under `fixtures/` instead of calling melee.gg, returning the same `Raw*Dto` shapes described in §3.
+- `MeleeMockClientService` implements the same client interface (`getTournamentInfo`, `getStandings`, `getRoster`, `getDecklists`) but reads from static JSON fixtures under `fixtures/` instead of calling melee.gg, returning the same `Raw*Dto` shapes described in §3. The same fixture set is reused for every league in mock mode — fixtures aren't per-league, since they're a stand-in for the shape of melee.gg's API, not for any particular org's real data.
 - Fixtures are hand-authored to approximate what the real API is expected to return (based on melee.gg's public documentation and, once obtained, the real Swagger spec) — they are a best-effort target shape, not a guarantee of the exact real response, and should be revisited once real credentials land and the actual response shape can be confirmed/diffed against them.
-- Mock mode is automatic (falls back whenever credentials are absent) so local development, CI, and any environment without real credentials keep working end-to-end — `MeleeSyncService`, the domain mapping, player matching, and decklist ingestion are all exercised against fixture data exactly as they would be against the real API.
-- Once real credentials are obtained, switching to the real client is just supplying `MELEE_CLIENT_ID`/`MELEE_CLIENT_SECRET` — no code change required, since `MeleeSyncService` only ever depends on the shared client interface, not on which implementation is active.
+- Mock mode is automatic per league (falls back whenever that league's `League` row has no usable credentials) so local development, CI, and any league without real credentials yet keep working end-to-end — `MeleeSyncService`, the domain mapping, player matching, and decklist ingestion are all exercised against fixture data exactly as they would be against the real API. A platform running some leagues with real credentials and others still in mock mode is expected and fine — each sync run resolves its own client independently.
+- Once a league's real credentials are obtained (via `POST /admin/leagues` at creation, or a future "update credentials" admin action), switching that league to the real client is just supplying valid `meleeClientIdEncrypted`/`meleeClientSecretEncrypted` — no code change required, since `MeleeSyncService` only ever depends on the shared client interface, not on which implementation is active.
 
 ## 6. Error handling summary
 
@@ -223,11 +299,12 @@ export class MeleeIntegrationModule {}
 | Decklist/roster fetch fails for one participant | That entry is skipped (`Decklist.status = 'PARTIAL'` or missing roster row), sync continues, overall `StageSyncLog.status = 'partial'`. |
 | Player name ambiguous/new | Not a melee-integration failure — handed off to the player-matching flow in `player-technical.md` §3, sync continues normally. |
 | melee.gg returns fewer/more players than expected `playerCount` | Logged as a warning in `StageSyncLog.message`, does not block sync (see `tournament-stage-technical.md` §Failure modes). |
+| `GET /api/tournament/list` (auto-include discovery, §2b) fails for a League | That league's whole sync run fails (nothing to auto-include or refresh without the tournament list); logged against that league only, other leagues' scheduled/manual syncs are unaffected (§4.2's per-League isolation note). |
 
 ## 7. Mapping summary (raw → domain)
 
 ```
-RawTournamentDto      -> Stage (metadata fields, isFinal/seasonId set by admin, status transition per tournament-stage-technical.md §2)
+RawTournamentDto      -> Stage (metadata fields; auto-included per §2b on first sight; isFinal/excluded set only by our admin, status transition per tournament-stage-technical.md §2)
 RawStandingsRowDto[]  -> Player/PlayerAlias resolution (player-technical.md §3) -> StagePlacement (league-scoring-technical.md §2)
 RawRosterEntryDto[]   -> Player/PlayerAlias resolution (player-technical.md §3)
 RawDecklistDto[]      -> Player/PlayerAlias resolution -> Decklist + DecklistEntry (decklists-technical.md §1-2), including Scryfall matching and visibility per decklists-technical.md §4

@@ -29,6 +29,12 @@ A player's profile aggregates everything the league knows about that person acro
 
 By default this is shown all-time, across every season the player has ever competed in. Since the league runs a fresh season each year (see `data-model-overview.md`), a profile can also be narrowed to a single season — the player's identity doesn't change between seasons, only which of their stage results count toward which season's standings.
 
+## Fixing duplicates: merging two player profiles
+
+Even with the matching described above, the same real person can occasionally slip through as two separate player profiles — most often when melee.gg exposes different identifying information across stages in a way the automatic matching can't reconcile on its own. Rather than guess, the system leaves this as a duplicate for a human to catch.
+
+When an admin notices this, they can **merge** the duplicate profile into the correct one: every placement and decklist that had ended up on the duplicate moves over to the real profile, so that person's full history — points, stages attended, decks played — is finally in one place. The duplicate profile itself isn't deleted; it's kept as a quiet historical marker pointing at the profile it was merged into, so nothing about the league's past record disappears, it's just no longer split in two. Like the other admin actions on this site, merging requires being logged in with access to the league the players belong to (see `security-overview.md`).
+
 ## Related documents
 
 - `league-scoring-overview.md` — how a player's per-stage results become their season total.

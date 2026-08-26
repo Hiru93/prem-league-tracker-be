@@ -4,7 +4,7 @@
 
 A **stage** ("tappa") is one tournament event in the league's season, run on melee.gg. This document describes what a stage represents, what information we keep about it, and how it moves through its lifecycle from "not yet played" to "final, part of league history."
 
-Every stage belongs to a **season** — the league runs a fresh season each year, so stages don't just accumulate into one league forever; they're grouped by which season they counted toward. See `data-model-overview.md` for the season concept itself.
+Every stage belongs to a **season**, and every season belongs to exactly one **league** — the platform can run several leagues at once, and within a league it runs a fresh season each year, so stages don't just accumulate into one league forever; they're grouped by which season (and which league) they counted toward. See `data-model-overview.md` for the league and season concepts.
 
 ## What a stage represents
 
@@ -29,6 +29,12 @@ A stage moves through a small number of states over its lifetime:
 3. **Closed** — the tournament has finished on melee.gg and its results have been pulled in and permanently stored in Prem League Tracker. From this point the stage's placements are treated as final league history and feed into the season standings.
 
 Only a **closed** stage contributes to league standings. A stage that's still open or in progress isn't final yet, so nothing about it can safely be locked into the season's points totals.
+
+## Every tournament in the league's melee.gg org becomes a stage automatically
+
+Stages aren't hand-picked by an admin anymore. As soon as a tournament exists under the league's melee.gg organization, it's automatically pulled in as a stage the next time that league syncs — whether that's the daily automatic check or an admin manually triggering a sync. There's no separate "approve this tournament" step.
+
+Because that's automatic, there's a safety net for the rare case something gets swept in that shouldn't count — a test event run in the same melee.gg organization, for example. An admin can mark that stage **excluded**: it disappears from the public stage list and from standings, but nothing about it is deleted, and un-excluding it later needs no re-sync. This is something an admin fixes after noticing a mistake, not something they have to approve in advance for every tournament.
 
 ## The season-ending final is a special kind of stage
 

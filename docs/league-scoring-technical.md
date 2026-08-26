@@ -76,28 +76,33 @@ Denormalizing `fieldSize` and `points` onto the placement row (rather than deriv
 
 ## 3. Overall standings aggregation
 
-Standings are scoped **per `Season`** (see `data-model-technical.md`) and explicitly **exclude any stage flagged `isFinal`**:
+Standings are scoped **per `Season`**, which in turn belongs to exactly one `League` (see `data-model-technical.md`'s `Season.leagueId`) — so a standings query is always implicitly scoped to one league too, since a `seasonId` never spans leagues. Aggregation explicitly **excludes any stage flagged `isFinal`, and — added 2026-08-26, second corner-case review — any stage flagged `excluded`**:
 
 ```
 totalPoints(player, season) = SUM(StagePlacement.points
                                    WHERE playerId = player
                                    AND stage.seasonId = season
-                                   AND stage.isFinal = false)
+                                   AND stage.isFinal = false
+                                   AND stage.excluded = false)
 stagesAttended(player, season) = COUNT(StagePlacement WHERE playerId = player
                                         AND stage.seasonId = season
-                                        AND stage.isFinal = false)
+                                        AND stage.isFinal = false
+                                        AND stage.excluded = false)
 ```
 
-Within a season, no regular stage is dropped/discarded — every regular stage attended counts toward the total, including a player's worst result. The **season-ending final is the one deliberate exception**: it's ingested and its own results are tracked (`StagePlacement` rows exist for it), but it is never included in `totalPoints`/`stagesAttended`, because qualification for the final is *derived from* the regular-season standings — folding its results back in would be circular, and per the product decision the final is display-only (see `tournament-stage-technical.md` §1a).
+Within a season, no regular, non-excluded stage is dropped/discarded — every such stage attended counts toward the total, including a player's worst result. Two deliberate exceptions:
 
-Because `StagePlacement.points` is already persisted, this aggregation is a cheap `GROUP BY` query (filtered by `stage.seasonId` and `stage.isFinal`) and does not need a separate cached "standings" table for the traffic profile in the memo (~100 visits/day). Recommended as a straightforward Prisma aggregation, optionally wrapped in a short-TTL in-memory cache (e.g. 60s) at the service layer if it becomes a hot path — not a hard requirement at current scale.
+- **The season-ending final** (`isFinal = true`): ingested and its own results are tracked (`StagePlacement` rows exist for it), but never included in `totalPoints`/`stagesAttended`, because qualification for the final is *derived from* the regular-season standings — folding its results back in would be circular, and per the product decision the final is display-only (see `tournament-stage-technical.md` §1a).
+- **An excluded stage** (`excluded = true`): an admin has flagged it as wrongly-included (e.g. a test tournament auto-synced from the league's melee.gg org — see `melee-integration-technical.md` §2b/§2c and `tournament-stage-technical.md` §1b). Its `StagePlacement` rows are retained but never summed, exactly like an `isFinal` stage — the two flags are independent and either one alone is sufficient to exclude a stage from aggregation; a stage could in principle be both, though that's not an expected combination in practice.
+
+Because `StagePlacement.points` is already persisted, this aggregation is a cheap `GROUP BY` query (filtered by `stage.seasonId`, `stage.isFinal`, and `stage.excluded`) and does not need a separate cached "standings" table for the traffic profile in the memo (~100 visits/day). Recommended as a straightforward Prisma aggregation, optionally wrapped in a short-TTL in-memory cache (e.g. 60s) at the service layer if it becomes a hot path — not a hard requirement at current scale.
 
 ```ts
 // standings/standings.service.ts (sketch)
 async function getSeasonStandings(prisma: PrismaClient, seasonId: string) {
   const rows = await prisma.stagePlacement.groupBy({
     by: ['playerId'],
-    where: { stage: { seasonId, isFinal: false } },
+    where: { stage: { seasonId, isFinal: false, excluded: false } },
     _sum: { points: true },
     _count: { _all: true },
   });
@@ -105,7 +110,7 @@ async function getSeasonStandings(prisma: PrismaClient, seasonId: string) {
 }
 ```
 
-The season-ending final's own results (who placed where in the Top-8 bracket) are exposed separately — see the frontend's forthcoming final-tournament page — via the regular `GET /stages/:stageId/placements` endpoint (§6) against the final's own `stageId`, same as any other stage; the only difference is this data is never summed into `totalPoints`.
+The season-ending final's own results (who placed where in the Top-8 bracket) are exposed separately — see the frontend's forthcoming final-tournament page — via the regular `GET /leagues/:leagueSlug/stages/:stageId/placements` endpoint (§6) against the final's own `stageId`, same as any other stage; the only difference is this data is never summed into `totalPoints`.
 
 ## 4. Sorting and Top-8 cutoff
 
@@ -139,7 +144,7 @@ Implementation requirement: the standings endpoint must **detect** this situatio
 ## 6. API shape
 
 ```
-GET /seasons/:seasonId/standings
+GET /leagues/:leagueSlug/seasons/:seasonId/standings
 ```
 
 Response:
@@ -147,14 +152,17 @@ Response:
 ```ts
 interface StandingsResponse {
   seasonId: string;
+  leagueId: string;
   basePoints: number;          // scoring config value used, for transparency
   generatedAt: string;         // ISO timestamp
-  rows: StandingsRow[];        // sorted per §4, rank implicit in array order — excludes isFinal stages per §3
+  rows: StandingsRow[];        // sorted per §4, rank implicit in array order — excludes isFinal and excluded stages per §3
 }
 ```
 
+`:seasonId` must belong to the league identified by `:leagueSlug` (per `Season.leagueId`) — a season id from a different league returns `404 Not Found`, same treatment as a nonexistent season, so a season's league scoping can't be probed by guessing ids across leagues.
+
 ```
-GET /stages/:stageId/placements
+GET /leagues/:leagueSlug/stages/:stageId/placements
 ```
 
 Response:
@@ -169,8 +177,11 @@ interface StagePlacementDto {
 }
 ```
 
+Same `excluded` → `404` treatment as `tournament-stage-technical.md` §1b/§3 — an excluded stage's placements are not servable via this route, indistinguishable from a nonexistent stage.
+
 ## 7. Failure modes
 
-- **Stage not yet closed**: a stage in `open` or `in_progress` lifecycle state (see `tournament-stage-technical.md`) has no finalized placements yet. `GET /stages/:stageId/placements` returns `409 Conflict` with a message indicating the stage isn't finalized, rather than partial/live standings.
+- **Stage not yet closed**: a stage in `open` or `in_progress` lifecycle state (see `tournament-stage-technical.md`) has no finalized placements yet. `GET /leagues/:leagueSlug/stages/:stageId/placements` returns `409 Conflict` with a message indicating the stage isn't finalized, rather than partial/live standings.
+- **Stage is excluded**: `GET /leagues/:leagueSlug/stages/:stageId/placements` returns `404 Not Found`, per §6 — an excluded stage's placement data is retained in the database (for the admin who excluded it to inspect/correct) but not served through the public API.
 - **Empty league (no stages ingested)**: standings endpoint returns `rows: []`, not an error.
 - **`fieldSize` of 0 or malformed placement data at ingestion**: reject the ingestion for that stage (see `tournament-stage-technical.md` §Failure modes) rather than persisting a `StagePlacement` that would divide by zero or produce a nonsensical points value.

@@ -30,13 +30,13 @@ Scryfall's REST API (`https://api.scryfall.com`) is used directly via HTTPS; no 
 
 Resolution order, per card name coming out of a decklist import:
 
-1. **Cache lookup** — build the Redis lookup key (see key scheme below) from the normalized incoming name (trim, collapse whitespace, lowercase) plus set/collector number if the source provided them. If a fresh entry exists (see TTL below), return it — no network call.
+1. **Cache lookup** — build the Redis lookup key (see key scheme below) from the normalized incoming name (trim, collapse whitespace, lowercase) plus set/collector number if the source provided them. If a fresh entry exists (see TTL below), return it — no network call. The cached DTO carries the `matchConfidence` (`EXACT`/`FUZZY`, see `data-model-technical.md`) determined the first time this card was resolved, so a cache hit doesn't need to re-derive it.
 2. **Cache miss or stale entry** — call Scryfall:
-   - If the import provided set code + collector number (melee.gg decklists sometimes carry this), use `GET /cards/:set/:collector_number`.
-   - Otherwise use the fuzzy name endpoint: `GET /cards/named?fuzzy=<name>`. Fuzzy matching tolerates minor typos and partial names, which is important because melee.gg decklist text entry is free-form.
-   - If the name appears to be non-English (heuristic: contains non-ASCII letters, or previous fuzzy lookup 404s), retry against `GET /cards/named?fuzzy=<name>` — Scryfall's fuzzy search already matches against printed foreign names in its search index, so a French/Japanese/German card name typically resolves directly without a separate "foreign name" endpoint.
-3. **Write-through to Redis** — store the resolved DTO under the lookup key (see below) and reset its TTL.
-4. **Return** the DTO to the caller (`DecklistsModule` at ingestion time), which persists `scryfallCardId` and `resolved = true` on the `DecklistEntry` (see `data-model-technical.md`) — the card's actual data is not duplicated into Postgres.
+   - If the import provided set code + collector number (melee.gg decklists sometimes carry this), use `GET /cards/:set/:collector_number` — a successful hit here is always `matchConfidence: EXACT` (an exact printing lookup, no name-matching heuristic involved).
+   - Otherwise use the fuzzy name endpoint: `GET /cards/named?fuzzy=<name>`. Fuzzy matching tolerates minor typos and partial names, which is important because melee.gg decklist text entry is free-form. If the returned card's name matches the input exactly (case-insensitive, post-normalization), record `matchConfidence: EXACT`; if Scryfall's fuzzy matching corrected anything non-trivial (typo, partial name, alternate spelling), record `matchConfidence: FUZZY` — this is the "best guess" signal `decklists-technical.md` §5 surfaces to the frontend.
+   - If the name appears to be non-English (heuristic: contains non-ASCII letters, or previous fuzzy lookup 404s), retry against `GET /cards/named?fuzzy=<name>` — Scryfall's fuzzy search already matches against printed foreign names in its search index, so a French/Japanese/German card name typically resolves directly without a separate "foreign name" endpoint. Same EXACT/FUZZY determination as above applies to the result.
+3. **Write-through to Redis** — store the resolved DTO (including the determined `matchConfidence`) under the lookup key (see below) and reset its TTL.
+4. **Return** the DTO to the caller (`DecklistsModule` at ingestion time), which persists `scryfallCardId`, `resolved = true`, and `matchConfidence` (`EXACT` or `FUZZY`, per above) on the `DecklistEntry` (see `data-model-technical.md`) — the card's actual data is not duplicated into Postgres. On a resolution failure (§Fallback behavior below), `DecklistsModule` instead persists `resolved = false`, `matchConfidence: UNMATCHED` (the field's default), `scryfallCardId: null`.
 
 ### Re-resolution after cache eviction
 
@@ -119,5 +119,5 @@ The guiding rule: a Scryfall failure of any kind must never fail decklist ingest
 ## Cross-references
 
 - `hosting-deployment-be-technical.md` — Upstash Redis provisioning, the local/prod cache-client config module, and env var injection.
-- `data-model-technical.md` — `DecklistEntry.scryfallCardId`/`resolved` fields and why card data itself isn't stored in Postgres.
-- `decklists-technical.md` — how ingestion invokes `ScryfallService` and renders unresolved entries.
+- `data-model-technical.md` — `DecklistEntry.scryfallCardId`/`resolved`/`matchConfidence` fields and why card data itself isn't stored in Postgres.
+- `decklists-technical.md` — how ingestion invokes `ScryfallService`, and how `matchConfidence` is surfaced to the API/frontend (the "best guess" indicator) and renders unresolved entries.

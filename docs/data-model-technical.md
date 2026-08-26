@@ -214,9 +214,16 @@ model DecklistEntry {
   quantity        Int
   isSideboard     Boolean   @default(false)
   resolved        Boolean   @default(false)
+  matchConfidence MatchConfidence @default(UNMATCHED) // how rawCardName was resolved to scryfallCardId — see scryfall-integration-technical.md §Card resolution; added 2026-08-26 (issue #75) to canonicalize a concept decklists-technical.md had defined locally
   scryfallCardId  String?                         // Scryfall's own card UUID once resolved — a lookup key into Redis, not a Postgres FK (see scryfall-integration-technical.md); no relation() here since the card data itself is never stored in this database
 
   @@index([decklistId])
+}
+
+enum MatchConfidence {
+  EXACT      // rawCardName matched a Scryfall card name exactly (case-insensitive), or an exact set+collector-number lookup was used
+  FUZZY      // matched via Scryfall's fuzzy-name endpoint with a non-trivial name difference — display with a subtle "best guess" indicator
+  UNMATCHED  // no Scryfall card found (or not yet attempted); entry stored/displayed as raw text only. Default — resolution moves it to EXACT/FUZZY on success, never the reverse.
 }
 ```
 
@@ -224,6 +231,7 @@ Notes:
 - `Placement.points` is persisted (not recomputed on every standings request) so that if `BASE_POINTS` config changes in the future, historical placements are unaffected — only newly-ingested stages use the new value. This preserves historical integrity in the same spirit as reason #1 above.
 - `Stage.playerCount` is snapshotted at ingestion (not derived by counting `Placement` rows live) so the scoring formula's `N` is fixed to what it was when the stage closed, even if `Placement` rows were ever corrected later.
 - `DecklistEntry.scryfallCardId` stores Scryfall's own card id once resolved, but is not a Postgres foreign key — the card data it identifies lives in Redis, not this database, and may be evicted/re-resolved independently (see `scryfall-integration-technical.md`).
+- `DecklistEntry.matchConfidence` (added 2026-08-26, resolving issue #75): `resolved: Boolean` alone only captures matched-vs-not, not *how confidently* — `matchConfidence` carries that signal (exact name match vs. a fuzzy Scryfall match worth flagging to the user vs. genuinely unmatched). `resolved = (matchConfidence !== 'UNMATCHED')` always holds; the two fields aren't independent, but `resolved` is kept as its own boolean since most read paths (e.g. "does this entry have a card image") only care about that, not the finer distinction — `decklists-technical.md` §5 is the one place `matchConfidence` itself is surfaced to the API.
 - **`Season`** (added 2026-08-26, per the corner-case review): supports running a fresh league each year rather than one league forever. Every `Stage` — including the season-ending final (`isFinal = true`) — belongs to exactly one `Season`. Standings aggregation (`league-scoring-technical.md`) is scoped per `Season`, not computed globally across all seasons ever played.
 - **`Stage.isFinal`**: distinguishes the season-ending final tournament from regular stages. It's ingested through the same melee.gg sync pipeline as any other stage, but `league-scoring-technical.md`'s standings aggregation explicitly excludes `isFinal = true` stages — the final's own results are tracked and displayed (a "league champion" callout) but never feed back into league points, since qualification for the final is itself derived from the regular-season standings.
 - **`DecklistVisibilityMode`**: scoped **per `Season`**, not global — a season-level admin can choose to make decklists visible immediately for an archived/past season while a live season still defaults to hiding them until each stage closes. The default (`HIDDEN_UNTIL_STAGE_CLOSE`) avoids meta-leaking mid-event; see `decklists-technical.md` for enforcement details. This is the "configurable setting" from the admin panel — flipping it is one of the actions gated behind admin login (see `security-technical.md`).

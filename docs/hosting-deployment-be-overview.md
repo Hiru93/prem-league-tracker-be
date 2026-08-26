@@ -2,27 +2,32 @@
 
 ## Where the API runs
 
-The backend API runs on [Render](https://render.com), on their free web service tier. Render runs our NestJS app as a normal, always-running Node process — which suits how NestJS apps work far better than a "serverless functions" platform would.
+The backend API runs on [Vercel](https://vercel.com), as a serverless Function. The NestJS app's Express adapter is wrapped behind a single catch-all handler so Vercel can invoke it like any other serverless entrypoint — see `hosting-deployment-be-technical.md` for the wrapper shape.
 
-## Why not a serverless platform like Vercel
+## Why not a long-running host like Render
 
-Vercel is excellent for static/frontend hosting (and is exactly what we use for the frontend, via GitHub Pages) but is a poor fit for a NestJS backend: serverless functions spin down when idle and cold-start on the next request, have execution time limits, and don't naturally support a persistent server process or background/scheduled jobs (like our melee.gg sync). Render, Railway, and Fly.io all support long-running Node containers on free tiers, which matches what NestJS actually needs. Render is the pick here for its simplicity of setup; Railway and Fly.io remain reasonable alternatives.
+An earlier version of this doc chose Render specifically because NestJS is normally a long-running server process, and serverless platforms are a worse fit for that. Mattia later directed the project onto Vercel anyway, for platform consolidation with the frontend and simpler end-to-end deploy tooling. The tradeoff is accepted, not undone: cold starts on an idle-then-invoked request are expected at this project's traffic scale (~100 visits/day) — the same "occasional first-request latency is fine for this audience" reasoning that previously applied to Render's spin-down now applies to Vercel's cold starts. There is no scheduled/background job requirement that this ownership needs long-running compute for — the melee.gg sync is admin-triggered, not a persistent cron process inside the API itself (see `melee-integration-technical.md`).
 
 ## Where the database lives
 
-The Postgres database runs on [Neon](https://neon.tech), a managed Postgres provider with a genuinely free tier. This is a deliberate choice over using Render's own free Postgres offering, because **Render's free Postgres databases are automatically deleted after 90 days** — which would be disastrous for a project whose entire point is preserving league history across an entire season and beyond. Neon's free tier has no such expiry.
+The Postgres database runs on [Neon](https://neon.tech), provisioned through **Vercel's own Neon marketplace integration** rather than set up separately — this injects `DATABASE_URL` automatically per environment (Production, each Preview deployment). Neon's free tier has no forced expiry, unlike Render's own free Postgres add-on (deleted after 90 days) — the reasoning that ruled out Render's Postgres originally still stands, only the surrounding platform changed.
+
+## Where the cache lives
+
+**Upstash Redis**, provisioned through Vercel's Upstash marketplace integration, is the caching layer — an HTTP-based Redis client, which fits serverless functions better than a persistent TCP connection would. It caches Scryfall card data and short-TTL computed league standings. Postgres remains the system of record for all ingested domain data; Redis is a fast layer in front of it, never the only copy of anything. See `scryfall-integration-technical.md` and `data-model-technical.md`.
 
 ## How deployments happen
 
-Code changes go through GitHub Actions:
-- Opening a pull request runs the test suite and linter as a required check — nothing gets deployed from a PR.
-- Merging to `master` automatically deploys the API to the production Render service.
-- Pushing to a `staging` branch (if a second Render service is set up for staging) deploys to that staging environment, so changes can be verified before going live.
+Vercel's native GitHub integration handles deploys directly — no custom GitHub Actions deploy step is needed:
+- Every push and PR gets an automatic **Preview Deployment**.
+- Pushing to `master` (configured as Vercel's Production Branch) triggers the **Production Deployment** automatically.
+- Pushing to `staging` gets its own Preview Deployment; if a stable staging URL is wanted, it's aliased via `vercel alias`.
 
-The credentials needed to trigger a Render deploy are stored securely in the repository's GitHub Settings, not in the codebase.
+`ci.yml` (GitHub Actions) still runs lint/test as a required check on PRs into `develop`/`master` — it gates merges, it doesn't deploy anything. The previous `deploy-production.yml`/`deploy-staging.yml` workflows, written for the Render deploy-hook model, have been retired (see `hosting-deployment-be-technical.md`).
 
 ## Related docs
 
-- `hosting-deployment-be-technical.md` — full CI/CD pipeline and environment configuration.
+- `hosting-deployment-be-technical.md` — full deploy flow, environment variables, and CI configuration.
 - `data-model-overview.md` — why a database is needed at all, which is what Neon hosts.
-- `security-overview.md` — how secrets like database credentials and deploy tokens are protected.
+- `scryfall-integration-technical.md` — what Redis caches and why.
+- `security-overview.md` — how secrets like database/cache credentials are protected.

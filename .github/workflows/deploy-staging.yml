@@ -1,0 +1,12 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches: [staging]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Render deploy (staging)
+        run: curl -X POST "${{ secrets.RENDER_DEPLOY_HOOK_STAGING }}"

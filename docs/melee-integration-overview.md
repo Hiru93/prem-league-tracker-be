@@ -6,7 +6,7 @@ melee.gg is the third-party platform the league actually plays its tournaments o
 
 ## melee.gg has a real, documented API — this isn't scraping
 
-**Update (2026-08-26)**: earlier drafts of this document assumed melee.gg had to be treated like any random website — scraped defensively, expecting its page structure to shift without warning. That assumption was wrong. melee.gg publishes a real, documented REST API (with a formal Swagger specification), and access to it is granted properly: an organization requests API credentials (a client ID and secret) by emailing melee.gg directly, after the tournament-organizing party authorizes it. Prem League Tracker integrates against that documented API, not by parsing HTML.
+**Update (2026-08-26)**: earlier drafts of this document assumed melee.gg had to be treated like any random website — scraped defensively, expecting its page structure to shift without warning. That assumption was wrong. melee.gg publishes a real, documented REST API (a full Swagger specification is even publicly browsable, no login required, at `melee.gg/swagger/ui/index`), and access to actually *call* it is granted properly: an organization requests API credentials (a client ID and secret) by emailing melee.gg directly, after the tournament-organizing party authorizes it. Those credentials are used as a username/password pair (HTTP Basic authentication) on every request. Prem League Tracker integrates against that documented API, not by parsing HTML.
 
 This is a meaningfully different, sturdier foundation than "treat melee.gg like a fragile scrape target": a documented API means a stable contract to build against, rather than a structure that could silently change. The integration still has to be a good citizen (respect rate limits, handle the occasional transient failure gracefully — see the technical doc), but that's normal, expected behavior for talking to any real API, not a defensive posture against an unstable source.
 
@@ -22,6 +22,7 @@ Importantly, that blocker doesn't stop backend development: the integration is b
 - **Standings** — the final placement of every player once a stage's tournament wraps up.
 - **Roster** — who participated, so their names can be matched to (or create) a player record.
 - **Decklists** — the cards each player registered for the tournament, when available.
+- **Pairings/matches** — round-by-round matchups, confirmed available via the same API (not just assumed, as earlier drafts had it).
 
 ## When data is pulled
 

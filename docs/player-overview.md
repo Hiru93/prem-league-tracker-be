@@ -27,6 +27,8 @@ A player's profile aggregates everything the league knows about that person acro
 - Their running season point total and stage count (the same numbers used for league standings — see `league-scoring-overview.md`).
 - Their decklists across stages, where available.
 
+By default this is shown all-time, across every season the player has ever competed in. Since the league runs a fresh season each year (see `data-model-overview.md`), a profile can also be narrowed to a single season — the player's identity doesn't change between seasons, only which of their stage results count toward which season's standings.
+
 ## Related documents
 
 - `league-scoring-overview.md` — how a player's per-stage results become their season total.

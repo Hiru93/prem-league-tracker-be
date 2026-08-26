@@ -2,7 +2,7 @@
 
 Defines storage for decklists, Scryfall card linking/caching, and handling of melee.gg data quality issues, consistent with the memo's Postgres decision (Scryfall data cached in its own long-TTL table).
 
-Related: `tournament-stage-technical.md` (stage a decklist belongs to), `player-technical.md` (owning player), `melee-integration-technical.md` (how decklists are fetched and mapped in).
+Related: `tournament-stage-technical.md` (stage a decklist belongs to), `player-technical.md` (owning player), `melee-integration-technical.md` (how decklists are fetched and mapped in), `data-model-technical.md` (`Season.decklistVisibilityMode`), `security-technical.md` (the admin guard on toggling visibility).
 
 ## 1. Data model
 
@@ -18,7 +18,7 @@ model Decklist {
   isLatest      Boolean  @default(true) // see §3
   submittedAt   DateTime?
   status        DecklistStatus @default(COMPLETE)
-  rawSource     Json?    // original scraped/parsed payload, kept for debugging/reprocessing
+  rawSource     Json?    // original fetched/parsed API payload, kept for debugging/reprocessing
   createdAt     DateTime @default(now())
 
   entries       DecklistEntry[]
@@ -93,9 +93,25 @@ If melee.gg exposes more than one decklist snapshot for a player in a stage (e.g
 - Exactly one `Decklist` per `(stageId, playerId)` has `isLatest = true` at any time — enforced at the application layer during ingestion (when a new snapshot is ingested, the previous latest is flipped to `false` in the same transaction).
 - `GET /stages/:stageId/decklists` and player-facing views return only `isLatest = true` decklists by default.
 - Older snapshots remain queryable (`GET /decklists/:id` by id, or a `?includeHistory=true` query param) for completeness, but are not surfaced in the default UI. This is a deliberate simplification: the league treats "the decklist" as the player's final/most recent submission for that stage, not a full round-by-round diff.
-- **Open question**: melee.gg's actual support for exposing multiple historical decklist snapshots per player is not confirmed (see `melee-integration-technical.md` §Endpoints — this needs real-world verification against melee.gg's actual tournament pages). The schema above supports it if available; if melee.gg only ever exposes the final decklist, every stage/player pair simply has a single `Decklist` row with `isLatest = true` and no history to show.
+- **Open question**: melee.gg's actual support for exposing multiple historical decklist snapshots per player is not confirmed (see `melee-integration-technical.md` §8 — this needs confirming against melee.gg's real Swagger spec once API access is obtained). The schema above supports it if available; if melee.gg only ever exposes the final decklist, every stage/player pair simply has a single `Decklist` row with `isLatest = true` and no history to show.
 
-## 4. API shape
+## 4. Visibility
+
+Decklists exist to let people study the meta, but showing a decklist before its stage has finished can leak information mid-event (an opponent scouting a later-round pairing). Visibility is controlled by `Season.decklistVisibilityMode` (see `data-model-technical.md`):
+
+```ts
+function isDecklistVisible(stage: { status: StageStatus; isFinal: boolean }, season: { decklistVisibilityMode: DecklistVisibilityMode }): boolean {
+  if (season.decklistVisibilityMode === 'ALWAYS_VISIBLE') return true;
+  return stage.status === 'CLOSED'; // HIDDEN_UNTIL_STAGE_CLOSE (default): visible once the stage closes, applies equally to isFinal stages
+}
+```
+
+- **Default (`HIDDEN_UNTIL_STAGE_CLOSE`)**: a decklist is hidden for as long as its stage is `OPEN` or `IN_PROGRESS`, and becomes visible automatically the moment the stage transitions to `CLOSED` (see `tournament-stage-technical.md` §2). No manual action needed for the common case.
+- **Admin override (`ALWAYS_VISIBLE`)**: an admin can flip a season's `decklistVisibilityMode` (via the guarded endpoint in `security-technical.md`) to make that season's decklists visible immediately, regardless of stage status — e.g. for an archived past season where meta-leaking is no longer a concern.
+- **What "hidden" means at the API level**: this is enforced at the point decklist content is served, not just in the UI. When a decklist is not visible, `GET /stages/:stageId/decklists/:playerId` for an **unauthenticated** request does not return `main`/`sideboard` entries at all — it returns the decklist's existence/status metadata only (so the UI can show "decklist hidden until this stage closes") with `main: []`, `sideboard: []`, and a `visible: false` flag. Full entries are only ever included once `isDecklistVisible` is true, or for a request carrying a valid admin session (admins can preview hidden decklists, e.g. to sanity-check ingestion before a stage closes).
+- `GET /stages/:stageId/decklists` (the stage-level listing) applies the same rule per decklist row — it does not selectively expose a "hint" of hidden content (no partial card names, no counts) beyond the status metadata above.
+
+## 5. API shape
 
 ```
 GET /stages/:stageId/decklists/:playerId
@@ -107,6 +123,7 @@ interface DecklistDto {
   playerId: string;
   stageId: string;
   status: 'COMPLETE' | 'PARTIAL' | 'MISSING';
+  visible: boolean;   // false when hidden per §4 — main/sideboard are empty in that case even if entries exist in storage
   submittedAt: string | null;
   main: DecklistEntryDto[];
   sideboard: DecklistEntryDto[];
@@ -126,8 +143,9 @@ interface DecklistEntryDto {
 }
 ```
 
-## 5. Failure modes
+## 6. Failure modes
 
+- **Decklist requested while hidden by an unauthenticated client**: not an error — returns `200` with `visible: false` and empty `main`/`sideboard` per §4, never a `403`/`404`, so the frontend can render a clear "hidden until stage closes" state rather than treating it as missing data.
 - **No decklist available on melee.gg for a player** (didn't submit, or melee.gg's decklist feature wasn't used for that stage): `Decklist.status = 'MISSING'` — the row is still created (empty `entries`) so the UI can distinguish "we checked and there's nothing" from "we haven't synced this yet." `GET /stages/:stageId/decklists/:playerId` returns `200` with `status: 'MISSING'` and empty arrays, not `404`.
 - **Malformed/partial source data** (e.g. melee.gg's page includes a main deck but the sideboard section fails to parse, or quantities are non-numeric): parse what can be parsed, mark `Decklist.status = 'PARTIAL'`, store the raw unparsed fragment in `rawSource` for later manual inspection/reprocessing. Never fail the whole stage sync because one player's decklist is malformed — this is isolated per player (see `tournament-stage-technical.md` §Failure modes on partial syncs).
 - **Scryfall API unreachable during ingestion**: entries are stored with `scryfallCardId = null`, `matchConfidence = UNMATCHED` as a temporary state, and are eligible for a later re-matching pass (e.g. a background job re-running unmatched entries). This does not block decklist ingestion itself — decklist storage does not hard-depend on Scryfall being up.

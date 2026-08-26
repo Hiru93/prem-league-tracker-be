@@ -1,39 +1,70 @@
 # Melee.gg Integration — Technical
 
-Defines the defensive integration strategy for pulling data from melee.gg, and how that data maps onto our domain model. melee.gg has no documented public API or published rate limits, so this module must treat it as a semi-fragile external dependency at every layer.
+## Status (rewritten 2026-08-26)
 
-Related: `tournament-stage-technical.md` (Stage/StagePlacement/StagePairing targets), `player-technical.md` (Player/PlayerAlias/UnresolvedPlayerMatch targets), `decklists-technical.md` (Decklist/DecklistEntry targets), `league-scoring-technical.md` (what depends on placements being correct).
+This document previously assumed melee.gg had no documented public API and had to be treated as a fragile scrape target (HTML parsing, structural-change detection, defensive per-field fallbacks). **That premise was wrong and this doc has been rewritten around the corrected one.**
 
-**Important caveat, stated explicitly rather than glossed over**: melee.gg's exact page structure, whether it exposes an internal JSON API vs. requiring HTML scraping, whether stable per-account IDs are available, and whether multiple decklist snapshots are exposed, are all things this document describes at a *conceptual/architectural* level. They must be verified against melee.gg's real, current site before or during implementation. Where the doc says "endpoint" below, read it as "the conceptual data source," not a confirmed URL.
+Re-verified against melee.gg's own policy (https://melee.gg/Policy/Api) and help docs (https://help.melee.gg/docs/api-use/): melee.gg has a real, documented **REST API (Swagger-based)**, gated behind **OAuth-style client-credentials auth** — a client ID and secret issued by melee.gg. Integration is against that documented API, not HTML scraping. The retry/backoff and rate-limit handling below still apply (any real API can be transiently unavailable or rate-limited), but the "the structure could silently change under us at any time" framing is gone — this is a contracted API surface, not a scrape target.
 
-## 1. Module shape (NestJS)
+**Active external blocker, not this doc's concern to track**: obtaining real client credentials requires (1) the organizing party for the league's tournaments authorizing melee.gg to grant API access, then (2) emailing `contact@melee.gg` to request the client ID/secret. Mattia has not completed this yet, and the timeline is outside our control (tracked as its own issue). This doc describes the **target design** to build against regardless of whether credentials have arrived — see §5 (mock mode) for how development proceeds in the meantime.
+
+Related: `tournament-stage-technical.md` (Stage/StagePlacement/StagePairing targets, including `isFinal`/`seasonId`), `player-technical.md` (Player/PlayerAlias/UnresolvedPlayerMatch targets), `decklists-technical.md` (Decklist/DecklistEntry targets, visibility), `league-scoring-technical.md` (what depends on placements being correct), `security-technical.md` (the admin login gating a manually-triggered sync).
+
+## 1. Authentication
+
+melee.gg issues a **client ID + client secret** per authorized organization/application (client-credentials style — conceptually the same shape as OAuth2 client-credentials grant: exchange the client ID/secret for a short-lived access token, then call the API with that token). Concretely:
+
+```ts
+// melee-auth.service.ts (sketch)
+interface MeleeCredentials {
+  clientId: string;
+  clientSecret: string;
+}
+
+interface MeleeAccessToken {
+  token: string;
+  expiresAt: Date;
+}
+```
+
+- `MELEE_CLIENT_ID` and `MELEE_CLIENT_SECRET` are read exclusively from environment variables via `@nestjs/config` — never hardcoded, never logged (per `security-technical.md`'s secrets-handling rules, which apply here without exception).
+- `MeleeAuthService` exchanges the client ID/secret for an access token against melee.gg's token endpoint (the exact endpoint/flow shape is documented in melee.gg's Swagger spec, which is not yet in hand — see the blocker note above; this doc describes the conceptual client-credentials exchange, to be finalized against the real spec once available), caches the token in memory, and refreshes it before expiry.
+- If `MELEE_CLIENT_ID`/`MELEE_CLIENT_SECRET` are unset (the expected state until the blocker above resolves), `MeleeAuthService` falls back to mock mode — see §5 — rather than failing to boot. This lets the rest of the backend (and its tests) run without real credentials.
+
+## 2. Module shape (NestJS)
 
 ```
 src/melee-integration/
-  melee-client.service.ts       // low-level HTTP/scraping client with retry+cache
-  melee-sync.service.ts         // orchestrates a stage sync, maps raw data -> domain entities
-  melee-sync.controller.ts      // admin-triggered sync endpoints (see tournament-stage-technical.md §2)
+  melee-auth.service.ts         // client-credentials exchange, token caching/refresh
+  melee-client.service.ts       // typed HTTP client against melee.gg's documented REST API
+  melee-mock-client.service.ts  // fixture-backed implementation of the same client interface, for mock mode
+  melee-sync.service.ts         // orchestrates a stage sync, maps raw API responses -> domain entities
+  melee-sync.controller.ts      // admin-triggered sync endpoint (see tournament-stage-technical.md §2), guarded per security-technical.md
   dto/
     raw-tournament.dto.ts
     raw-standings-row.dto.ts
     raw-decklist.dto.ts
-    raw-pairing.dto.ts
+    raw-roster-entry.dto.ts
+  fixtures/
+    tournament-info.sample.json
+    standings.sample.json
+    decklists.sample.json
+    roster.sample.json
   melee-integration.module.ts
 ```
 
-`MeleeSyncService` is the only consumer of `MeleeClientService`; nothing else in the codebase talks to melee.gg directly. This keeps the "melee.gg is fragile" concern isolated to one module.
+`MeleeSyncService` depends on an injected `MeleeClient` interface; `MeleeClientService` (real API) and `MeleeMockClientService` (fixtures) are two interchangeable implementations of it, selected at module-init time per §5. Nothing else in the codebase talks to melee.gg directly.
 
-## 2. Conceptual endpoints/pages consumed
+## 3. Documented endpoints consumed (conceptual)
 
-| Conceptual source | Used for | Maps to |
+The exact request/response shapes come from melee.gg's Swagger spec, which isn't available to this repo yet (blocked on credentials — see Status above). This table describes the endpoints **conceptually**, by the data each is expected to expose, based on melee.gg's public API documentation pages. Field names below are illustrative placeholders to be reconciled against the real spec once obtained.
+
+| Conceptual endpoint | Used for | Maps to |
 |---|---|---|
-| Tournament info page/endpoint | name, date, format, status (upcoming/live/completed), field size | `Stage` metadata (`tournament-stage-technical.md`) |
-| Standings page/endpoint | final placement per participant, tiebreaker info if any | `StagePlacement` (`league-scoring-technical.md`) |
-| Round/pairings page/endpoint | per-round matchups and results | `StagePairing` (`tournament-stage-technical.md`) |
-| Decklist page/endpoint per participant | main deck + sideboard card list, submission timestamp, possibly multiple snapshots | `Decklist` + `DecklistEntry` (`decklists-technical.md`) |
-| Player/roster info (embedded in standings or a separate roster page) | participant display name, possibly a stable account id | `PlayerAlias` (`player-technical.md`) |
-
-Each is fetched via `MeleeClientService`, which returns typed raw DTOs (`RawTournamentDto`, `RawStandingsRowDto`, etc.) before any mapping to domain entities happens — this keeps "what melee.gg gave us" separate from "what we stored," which matters when melee.gg's format shifts (only the raw DTO/parsing layer needs to change).
+| Tournament info | name, date, format, status (upcoming/live/completed), field size | `Stage` metadata (`tournament-stage-technical.md`), including `isFinal` set by the admin at link time, not read from melee.gg |
+| Standings | final placement per participant, tiebreaker info if any | `StagePlacement` (`league-scoring-technical.md`) |
+| Roster | tournament participants, display name, a stable per-account id if exposed | `PlayerAlias` (`player-technical.md`) |
+| Decklists | main deck + sideboard card list per participant, submission timestamp, possibly multiple snapshots | `Decklist` + `DecklistEntry` (`decklists-technical.md`) |
 
 ```ts
 interface RawTournamentDto {
@@ -51,6 +82,11 @@ interface RawStandingsRowDto {
   placement: number;
 }
 
+interface RawRosterEntryDto {
+  meleeUserId: string | null;
+  rawPlayerName: string;
+}
+
 interface RawDecklistDto {
   meleeUserId: string | null;
   rawPlayerName: string;
@@ -60,30 +96,26 @@ interface RawDecklistDto {
   mainDeck: { rawName: string; quantity: number }[];
   sideboard: { rawName: string; quantity: number }[];
 }
-
-interface RawPairingDto {
-  round: number;
-  tableNumber: number | null;
-  player1RawName: string;
-  player2RawName: string | null; // null = bye
-  result: string | null;
-}
 ```
 
-## 3. Defensive fetching strategy
+Each call returns a typed raw DTO before any mapping to domain entities happens — this keeps "what melee.gg's API returned" separate from "what we stored," so a future spec version bump only touches the raw DTO/mapping layer, not the domain model.
 
-### 3.1 Rate limiting / politeness
+`StagePairing` (round-by-round matchups, see `tournament-stage-technical.md`) is out of scope for this rewrite's confirmed endpoint list — melee.gg's documented API is expected to expose pairings/rounds as part of the standard tournament data set, but this needs confirming against the real Swagger spec once available; treat it as likely-supported, not yet verified.
 
-Since there's no published limit, the client self-imposes a conservative one:
+## 4. Rate limits and error handling
+
+Unlike the previous "undocumented site, assume the worst" framing, a real documented API is expected to publish actual rate limits and a stable error-response contract in its Swagger spec. Until that spec is in hand, the client still applies conservative, real-API-appropriate defaults rather than assuming no limits exist at all:
+
+### 4.1 Rate limiting
 
 ```ts
 // melee-client.service.ts (sketch)
-const MIN_REQUEST_INTERVAL_MS = parseInt(process.env.MELEE_MIN_REQUEST_INTERVAL_MS ?? '1500', 10);
+const MIN_REQUEST_INTERVAL_MS = parseInt(process.env.MELEE_MIN_REQUEST_INTERVAL_MS ?? '500', 10);
 ```
 
-All outgoing requests within one sync run are serialized through a simple queue that enforces at least `MIN_REQUEST_INTERVAL_MS` between requests, rather than fetching pages concurrently. A single stage sync (tournament info + standings + N players' decklists + pairings) is not latency-sensitive — it runs as an explicit admin-triggered background operation, not on a user-facing request path, so trading speed for politeness is the right tradeoff.
+Requests within one sync run are serialized through a queue enforcing at least `MIN_REQUEST_INTERVAL_MS` between calls, and any documented per-minute/per-hour limit from the real spec is honored once known (tracked via a config value, not hardcoded, so it can be tightened/loosened without a code change). A stage sync is an explicit admin-triggered background operation, not on a user-facing request path, so there's no latency pressure pushing toward higher concurrency.
 
-### 3.2 Retry with backoff
+### 4.2 Retry with backoff
 
 ```ts
 interface RetryConfig {
@@ -110,65 +142,70 @@ async function fetchWithRetry(fn: () => Promise<Response>, cfg: RetryConfig): Pr
 }
 ```
 
-- Retryable: network errors, `429 Too Many Requests`, `5xx`.
-- Not retryable (fail fast): `404 Not Found` (tournament doesn't exist / URL wrong), `401`/`403` (blocked/auth issue — needs human attention, retrying won't help), and any successful response that fails to parse (structure change — see §4).
-- A `429` response, if it carries a `Retry-After` header, should have that value respected as a floor on the backoff delay rather than the computed exponential value, when present.
+- **Retryable**: network errors, `429 Too Many Requests`, `5xx` — the standard set of transient failures for any real API, ours included.
+- **Not retryable (fail fast)**: `404 Not Found` (tournament id doesn't exist / wrong id), `401` (access token missing/expired/invalid — triggers a token refresh via `MeleeAuthService` and a single retry, not the general backoff loop), `403` (credentials valid but not authorized for this resource — needs human attention, retrying won't help).
+- A `429` response, if it carries a `Retry-After` header, has that value respected as a floor on the backoff delay rather than the computed exponential value, when present — standard behavior for a rate-limited REST API.
 
-### 3.3 Caching fetched pages
+### 4.3 Token expiry mid-sync
 
-Raw fetched payloads (HTML or JSON, whatever the source turns out to be) are cached by URL for a short TTL to avoid re-fetching the same page multiple times within one sync run (e.g. a tournament info page might be referenced when resolving both standings and pairings):
+A long-running sync (many decklists to fetch) can outlive the access token's lifetime. `MeleeClientService` checks token freshness before each call and transparently refreshes via `MeleeAuthService` if it's within a safety margin (e.g. 60s) of expiry, rather than letting calls fail with `401` and relying on the general retry path for this specific case.
 
-```prisma
-model MeleeFetchCache {
-  id          String   @id @default(cuid())
-  url         String   @unique
-  rawBody     String   @db.Text
-  fetchedAt   DateTime @default(now())
-  statusCode  Int
-}
+## 5. Mock mode (fixture-based)
+
+Because real client credentials are an active external blocker with an unknown timeline (see Status above), `MeleeClientService` is not the only implementation of the client interface development runs against.
+
+```ts
+// melee-integration.module.ts (sketch)
+const useMock = !process.env.MELEE_CLIENT_ID || !process.env.MELEE_CLIENT_SECRET || process.env.MELEE_MOCK_MODE === 'true';
+
+@Module({
+  providers: [
+    {
+      provide: MELEE_CLIENT,
+      useClass: useMock ? MeleeMockClientService : MeleeClientService,
+    },
+    MeleeSyncService,
+  ],
+})
+export class MeleeIntegrationModule {}
 ```
 
-- TTL: short, e.g. 1 hour (`MELEE_FETCH_CACHE_TTL_MS` env var) — this is a courtesy/debugging cache to avoid redundant fetches within and across nearby sync attempts, not a long-term store (that's what the domain tables in `tournament-stage-technical.md` etc. are for once parsed and confirmed correct).
-- On a sync retry after a failure, previously successfully-fetched pages within the TTL window are reused from cache rather than re-fetched, so a failure partway through a multi-page sync doesn't force redundant traffic against melee.gg for the parts that already succeeded.
-- Cache rows older than TTL are safe to prune (e.g. lazily, or via a periodic cleanup) since they're not authoritative data.
+- `MeleeMockClientService` implements the same client interface (`getTournamentInfo`, `getStandings`, `getRoster`, `getDecklists`) but reads from static JSON fixtures under `fixtures/` instead of calling melee.gg, returning the same `Raw*Dto` shapes described in §3.
+- Fixtures are hand-authored to approximate what the real API is expected to return (based on melee.gg's public documentation and, once obtained, the real Swagger spec) — they are a best-effort target shape, not a guarantee of the exact real response, and should be revisited once real credentials land and the actual response shape can be confirmed/diffed against them.
+- Mock mode is automatic (falls back whenever credentials are absent) so local development, CI, and any environment without real credentials keep working end-to-end — `MeleeSyncService`, the domain mapping, player matching, and decklist ingestion are all exercised against fixture data exactly as they would be against the real API.
+- Once real credentials are obtained, switching to the real client is just supplying `MELEE_CLIENT_ID`/`MELEE_CLIENT_SECRET` — no code change required, since `MeleeSyncService` only ever depends on the shared client interface, not on which implementation is active.
 
-This is distinct from the `ScryfallCard` cache in `decklists-technical.md` (30-day TTL for stable card data) — melee.gg tournament pages change frequently while a tournament is live, so a much shorter TTL applies here.
-
-## 4. Handling structural changes ("page changed shape")
-
-Parsing raw melee.gg pages into `Raw*Dto` shapes is isolated into dedicated parser functions per data source (`parseTournamentInfo(html): RawTournamentDto`, etc.). When a parser can't find an expected field/selector:
-
-- It throws a typed `MeleeParseError` including the parser name and (truncated) raw source, rather than returning a partially-populated or guessed DTO.
-- `MeleeSyncService` catches `MeleeParseError` per data source independently — e.g. a broken pairings parser does not prevent standings and decklists from being ingested successfully, since these are somewhat independent conceptual sources per §2. This matches `tournament-stage-technical.md`'s partial-sync handling: the sync overall is marked `partial`, not `failed`, if the core standings ingestion succeeds but a secondary source (e.g. pairings) does not.
-- Standings parsing failing (the one path that actually affects scoring — see `league-scoring-technical.md`) is treated as sync-critical: if standings can't be parsed, the whole sync is `failed` and the stage does not close, per `tournament-stage-technical.md` §Failure modes.
-- `MeleeParseError` occurrences are logged with enough context (URL, parser name, timestamp) to prioritize fixing the parser, since a melee.gg redesign will surface as a cluster of these across syncs, not gradually.
-
-## 5. Error handling summary
+## 6. Error handling summary
 
 | Failure | Behavior |
 |---|---|
-| melee.gg unreachable (network/timeout) | Retry per §3.2; after exhausting retries, sync fails, `StageSyncLog.status = 'failed'`, stage unchanged. |
-| `429` / throttled | Retry with backoff honoring `Retry-After` if present. |
-| `404` on tournament URL | Fail fast, no retry — likely a wrong/stale `meleeTournamentId`; surfaced to admin immediately. |
-| Standings page structure changed / unparseable | Sync fails (critical path), logged as `MeleeParseError`; stage unchanged. |
-| Decklist/pairings page structure changed for one player/round | That entry is skipped (`Decklist.status = 'PARTIAL'` or missing pairing row), sync continues, overall `StageSyncLog.status = 'partial'`. |
+| melee.gg unreachable (network/timeout) | Retry per §4.2; after exhausting retries, sync fails, `StageSyncLog.status = 'failed'`, stage unchanged. |
+| `429` / rate limited | Retry with backoff honoring `Retry-After` if present. |
+| `401` (token expired/invalid) | Refresh token via `MeleeAuthService` and retry once; if still `401`, fail fast — credentials likely invalid/revoked, needs admin attention. |
+| `403` (not authorized for this resource) | Fail fast, no retry — surfaced to admin immediately; likely means access scope doesn't cover this tournament/org. |
+| `404` on tournament id | Fail fast, no retry — likely a wrong/stale `meleeTournamentId`; surfaced to admin immediately. |
+| Standings fetch fails after retries | Sync fails (critical path — this is the one data source that affects scoring, see `league-scoring-technical.md`); stage unchanged. |
+| Decklist/roster fetch fails for one participant | That entry is skipped (`Decklist.status = 'PARTIAL'` or missing roster row), sync continues, overall `StageSyncLog.status = 'partial'`. |
 | Player name ambiguous/new | Not a melee-integration failure — handed off to the player-matching flow in `player-technical.md` §3, sync continues normally. |
 | melee.gg returns fewer/more players than expected `playerCount` | Logged as a warning in `StageSyncLog.message`, does not block sync (see `tournament-stage-technical.md` §Failure modes). |
 
-## 6. Mapping summary (raw → domain)
+## 7. Mapping summary (raw → domain)
 
 ```
-RawTournamentDto        -> Stage (metadata fields, status transition per tournament-stage-technical.md §2)
-RawStandingsRowDto[]    -> Player/PlayerAlias resolution (player-technical.md §3) -> StagePlacement (league-scoring-technical.md §2)
-RawPairingDto[]         -> StagePairing (tournament-stage-technical.md §1), resolving player1/player2 the same way as standings
-RawDecklistDto[]        -> Player/PlayerAlias resolution -> Decklist + DecklistEntry (decklists-technical.md §1-2), including Scryfall matching
+RawTournamentDto      -> Stage (metadata fields, isFinal/seasonId set by admin, status transition per tournament-stage-technical.md §2)
+RawStandingsRowDto[]  -> Player/PlayerAlias resolution (player-technical.md §3) -> StagePlacement (league-scoring-technical.md §2)
+RawRosterEntryDto[]   -> Player/PlayerAlias resolution (player-technical.md §3)
+RawDecklistDto[]      -> Player/PlayerAlias resolution -> Decklist + DecklistEntry (decklists-technical.md §1-2), including Scryfall matching and visibility per decklists-technical.md §4
 ```
 
-All player-name resolution across standings, pairings, and decklists funnels through the single matching algorithm in `player-technical.md` §3, so the same person is recognized consistently regardless of which melee.gg data source their name came from within one sync run.
+All player-name resolution across standings, roster, and decklists funnels through the single matching algorithm in `player-technical.md` §3, so the same person is recognized consistently regardless of which melee.gg endpoint their name came from within one sync run.
 
-## 7. Open questions requiring real-world verification
+## 8. Open items requiring the real Swagger spec
 
-- Whether melee.gg exposes a stable per-participant account id (`meleeUserId`) usable for reliable player matching, or only free-text display names.
-- Whether melee.gg exposes multiple decklist snapshots per player per stage, or only the final submission.
-- Whether melee.gg has an underlying JSON API (even if undocumented/internal) versus requiring HTML scraping — this affects the concrete implementation of `MeleeClientService` but not the architecture described above.
-- Actual observed rate-limiting behavior (whether `429`s occur in practice, or bans manifest differently, e.g. silent HTML changes or CAPTCHA challenges) — the retry/backoff config values in §3 are reasonable defaults to start from, not values validated against real observed melee.gg behavior yet.
+These are not blockers to building against this doc's design (mock mode covers development), but need reconciling once melee.gg credentials/spec access arrives:
+
+- Exact request/response shapes for each endpoint in §3 (field names above are illustrative placeholders).
+- The precise client-credentials token exchange endpoint and flow.
+- Documented, published rate limits (to replace the conservative defaults in §4.1 with the real ceiling).
+- Whether pairings/rounds data is exposed via the same API surface, and in what shape.
+- Whether a stable per-participant account id (`meleeUserId`) is present on every endpoint that returns a player name, or only some.

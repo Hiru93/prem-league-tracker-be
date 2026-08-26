@@ -16,10 +16,14 @@ In practice this means:
 
 ## How the season works
 
-- The league runs across multiple stages over a season.
-- A player accumulates points from **every stage they attend** — no stage is thrown out or discounted, even a player's worst result still counts.
-- At the end of the season, players are ranked by their **total accumulated points** across all stages.
+- The league runs across multiple stages over a season, and a fresh season starts each year — standings are always computed within one season, not accumulated forever across every season ever played.
+- A player accumulates points from **every regular stage they attend within that season** — no stage is thrown out or discounted, even a player's worst result still counts.
+- At the end of the season, players are ranked by their **total accumulated points** across all regular stages in that season.
 - The **top 8 players** in that ranking qualify for the season-ending final tournament.
+
+## The final tournament doesn't add points
+
+The season-ending final (the Top-8 bracket) is played, tracked, and displayed on the site — including a "league champion" callout — but its results are **display-only**: they never get added into anyone's season point total. The final is the reward for a strong regular season, not one more stage to score; scoring it would be circular, since qualification for it is decided *by* the regular-season standings in the first place. See `tournament-stage-overview.md` for how the final is modeled.
 
 ## Breaking ties for the Top 8
 

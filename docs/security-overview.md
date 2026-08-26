@@ -11,9 +11,11 @@ Prem League Tracker expects very little traffic (roughly 100 visits/day among fr
 - **CORS policy**: in production, only our actual deployed frontend is allowed to call the API from a browser. In local development, this is relaxed so developers aren't blocked while testing.
 - **Input validation**: every piece of data the API accepts from the outside world (query params, request bodies) is checked against an expected shape before any code acts on it, rejecting anything malformed.
 - **Database hardening**: the database itself uses a restricted-permission account (not a superuser), isn't reachable directly from the public internet outside of the app's own connection, and its credentials are never hardcoded anywhere.
+- **Admin login**: the site's sensitive actions — triggering a melee.gg sync, resolving an ambiguous player match, and toggling whether a season's decklists are visible early — are locked behind a real login (email + password, not a shared secret code). Only someone who's logged in as an admin (Mattia today, potentially other trusted moderators later) can perform these actions; everyone else only ever sees the public, read-only site.
 
 ## Related docs
 
 - `security-technical.md` — the concrete implementation of all of the above.
 - `hosting-deployment-be-technical.md` — where secrets are configured for the deployed environment.
 - `backend-architecture-overview.md` — how validation fits into the request-handling flow.
+- `data-model-overview.md` — the admin accounts and season decklist-visibility setting the login system protects.

@@ -15,10 +15,11 @@ enum StageStatus {
 
 model Stage {
   id            String       @id @default(cuid())
-  leagueId      String
-  league        League       @relation(fields: [leagueId], references: [id])
+  seasonId      String
+  season        Season       @relation(fields: [seasonId], references: [id]) // the league edition this stage's results count toward; see data-model-technical.md
   name          String       // e.g. "Tappa 3 - Modern"
-  sequence      Int          // ordering within the league/season
+  sequence      Int          // ordering within the season
+  isFinal       Boolean      @default(false) // true only for the season-ending final tournament (Top-8) — see §1a
   meleeTournamentId String?  @unique // melee.gg's identifier, nullable until first sync
   meleeUrl      String?
   status        StageStatus  @default(OPEN)
@@ -32,7 +33,7 @@ model Stage {
   pairings      StagePairing[]
   syncLogs      StageSyncLog[]
 
-  @@index([leagueId, sequence])
+  @@index([seasonId, sequence])
 }
 
 model StagePairing {
@@ -65,6 +66,14 @@ model StageSyncLog {
 
 `StagePlacement` is defined in `league-scoring-technical.md` §2; it belongs conceptually to the stage but its shape is owned by the scoring doc since `points`/`fieldSize` are scoring concerns.
 
+`Season` (and `DecklistVisibilityMode`, `AdminUser`) are defined in `data-model-technical.md`; this doc only adds the `seasonId` FK on `Stage`.
+
+### 1a. `isFinal` — the season-ending final tournament
+
+Once a season's regular stages are complete, the Top 8 of the standings (per `league-scoring-technical.md` §4) play a season-ending final tournament. That final is **ingested exactly like any other stage** — same melee.gg sync flow, same `Stage`/`StagePlacement`/`StageSyncLog` rows — but with `isFinal = true` set (either when the admin creates/links the `Stage` record, or via a request field on the sync endpoint, see §2).
+
+`isFinal = true` changes only one thing structurally: `league-scoring-technical.md`'s standings aggregation explicitly excludes it. The final's own results (who won, full bracket/placement) are stored and displayed — a "league champion" callout on the frontend — but never add points to the regular-season totals, since qualification for the final is derived *from* those totals in the first place. Everything else about a final stage (lifecycle states, decklist ingestion/visibility, pairings) behaves identically to a regular stage.
+
 ## 2. Lifecycle
 
 ```
@@ -73,7 +82,7 @@ OPEN ──(melee tournament detected/started)──> IN_PROGRESS ──(melee t
 
 - **OPEN**: stage record exists (created manually by an admin, or auto-created as a placeholder for the season schedule) but no meaningful melee.gg data has been pulled yet, or the tournament hasn't started. `meleeTournamentId` may be null if the melee.gg event hasn't been created/linked yet.
 - **IN_PROGRESS**: an admin has linked a melee.gg tournament (`meleeTournamentId` set) and the tournament is running. Live pairings *may* be pulled for informational display, but **no `StagePlacement` rows exist yet** — nothing counts toward scoring while in this state.
-- **CLOSED**: an explicit sync operation (see `melee-integration-technical.md` §Sync trigger) has fetched final standings from melee.gg, and the backend has persisted `StagePlacement` rows for every player, set `Stage.playerCount`, and set `closedAt`. Once closed, the stage's placements are treated as immutable league history for scoring purposes.
+- **CLOSED**: an explicit sync operation (see `melee-integration-technical.md` §2 for the module shape and §6 for error handling) has fetched final standings from melee.gg's API, and the backend has persisted `StagePlacement` rows for every player, set `Stage.playerCount`, and set `closedAt`. Once closed, the stage's placements are treated as immutable league history for scoring purposes.
 
 ### Transition triggers
 
@@ -92,9 +101,12 @@ A closed stage's data can be wrong (melee.gg data entry error, corrected after t
 POST /admin/stages/:stageId/sync
 ```
 
+Protected by the admin auth guard (see `security-technical.md` §Authentication / admin actions) — requires a valid admin session/JWT from the login system, not just a shared secret.
+
 ```ts
 interface SyncStageRequest {
   meleeTournamentId?: string; // required if not already linked on the Stage
+  isFinal?: boolean; // set true when linking/syncing the season-ending final tournament; ignored on re-sync (isFinal is fixed after first sync)
 }
 
 interface SyncStageResponse {
@@ -114,9 +126,10 @@ GET /stages/:stageId
 ```ts
 interface StageDto {
   id: string;
-  leagueId: string;
+  seasonId: string;
   name: string;
   sequence: number;
+  isFinal: boolean;
   status: 'OPEN' | 'IN_PROGRESS' | 'CLOSED';
   meleeUrl: string | null;
   playerCount: number | null;
@@ -142,7 +155,7 @@ interface PairingDto {
 ## 4. Failure modes
 
 - **Sync attempted on a stage with no `meleeTournamentId` and none provided in the request**: `400 Bad Request`.
-- **melee.gg unreachable or page structure changed during sync**: sync aborts, `StageSyncLog.status = 'failed'`, stage status is left unchanged (does not transition to CLOSED on a failed sync). See `melee-integration-technical.md` §Error handling for retry/backoff behavior.
+- **melee.gg unreachable, unauthorized, or the standings fetch otherwise fails during sync**: sync aborts, `StageSyncLog.status = 'failed'`, stage status is left unchanged (does not transition to CLOSED on a failed sync). See `melee-integration-technical.md` §6 (Error handling summary) for retry/backoff behavior.
 - **Partial data** (e.g. standings fetched but a subset of placement rows are malformed/unparseable): sync records `StageSyncLog.status = 'partial'` with details in `message`, and — to avoid persisting an inconsistent "closed" state that Top-8/scoring logic would treat as authoritative — the stage is **not** transitioned to `CLOSED` until a sync fully succeeds. Admins can inspect `StageSyncLog.message` to see what failed.
 - **Duplicate sync of an already-closed stage with identical data**: idempotent — re-running produces the same `StagePlacement` rows (delete-and-reinsert), no duplicate rows, thanks to the `@@unique([stageId, playerId])` constraint in `league-scoring-technical.md`.
 - **`playerCount` mismatch** between the number of `StagePlacement` rows ingested and melee.gg's reported field size: treated as a data integrity warning, logged in `StageSyncLog.message`, but does not block closing the stage (melee.gg's own metadata can be inconsistent — see `melee-integration-technical.md`).

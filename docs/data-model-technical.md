@@ -14,7 +14,7 @@ The fix: once a stage (tappa) closes, we run an ingestion step that pulls the fi
 
 ### 2. Rate limits / respectful use of melee.gg
 
-melee.gg does not publish a documented, generously-limited public API contract the way Scryfall does. It's a tournament-organizing platform; scraping/calling it repeatedly for every visitor page load is both fragile (subject to undocumented throttling or IP blocks) and inconsiderate of a service we don't control and don't want to jeopardize our access to. Structuring the system so melee.gg is called **once per stage** (at ingestion time — either a manual admin-triggered sync after the tournament ends, or a scheduled job checking for newly-closed stages) rather than once per page view keeps our footprint on melee.gg minimal and predictable, regardless of how much traffic our own site gets.
+melee.gg does have a documented API (see `melee-integration-technical.md`), but it's still a tournament-organizing platform's API, not a generously-limited public data service the way Scryfall's is, and access to it is a credentialed, gated relationship we don't want to jeopardize. Calling it repeatedly for every visitor page load would still be both unnecessary load on a service we don't control and a bad way to treat that access. Structuring the system so melee.gg is called **once per stage** (at ingestion time — either a manual admin-triggered sync after the tournament ends, or a scheduled job checking for newly-closed stages) rather than once per page view keeps our footprint on melee.gg minimal and predictable, regardless of how much traffic our own site gets.
 
 ### 3. Computed standings caching
 
@@ -43,11 +43,49 @@ This is the canonical schema; individual module docs (`tournament-stage-technica
 ```prisma
 // schema.prisma (sketch — field types illustrative, not exhaustive)
 
+model Season {
+  id            String       @id @default(cuid())
+  name          String                          // e.g. "Season 2026"
+  year          Int
+  isActive      Boolean      @default(false)     // the season new stages attach to by default; exactly one should be true at a time
+  decklistVisibilityMode DecklistVisibilityMode @default(HIDDEN_UNTIL_STAGE_CLOSE) // see DecklistVisibilityMode below
+  startsAt      DateTime?
+  endsAt        DateTime?
+  createdAt     DateTime     @default(now())
+
+  stages        Stage[]
+
+  @@index([year])
+}
+
+enum DecklistVisibilityMode {
+  HIDDEN_UNTIL_STAGE_CLOSE  // default: a stage's decklists are only served in full once that stage is closed
+  ALWAYS_VISIBLE            // admin override for this season: serve decklists as soon as they're ingested, regardless of stage status
+}
+
+model AdminUser {
+  id            String       @id @default(cuid())
+  email         String       @unique
+  passwordHash  String                           // bcrypt/argon2 hash — never plaintext, never logged
+  displayName   String?
+  role          AdminRole    @default(ORGANIZER)
+  createdAt     DateTime     @default(now())
+  lastLoginAt   DateTime?
+}
+
+enum AdminRole {
+  ORGANIZER   // Mattia — full access
+  MODERATOR   // future: other trusted moderators, same guarded actions
+}
+
 model Stage {
   id            String       @id @default(cuid())
+  seasonId      String                          // which season this stage's results count toward
+  season        Season       @relation(fields: [seasonId], references: [id])
   name          String                          // e.g. "Tappa 3 - Modern"
   meleeEventId  String       @unique             // melee.gg tournament id, for idempotent re-sync
   format        String                           // e.g. "Modern", "Pioneer"
+  isFinal       Boolean      @default(false)     // true for the season-ending final tournament — ingested like any stage, but excluded from league-scoring aggregation (see league-scoring-technical.md)
   playerCount   Int                              // N in the scoring formula — snapshotted at close
   closedAt      DateTime                         // when the stage concluded on melee.gg
   ingestedAt    DateTime     @default(now())     // when we snapshotted it
@@ -55,6 +93,7 @@ model Stage {
   decklists     Decklist[]
 
   @@index([closedAt])
+  @@index([seasonId])
 }
 
 model Player {
@@ -132,6 +171,10 @@ Notes:
 - `Placement.points` is persisted (not recomputed on every standings request) so that if `BASE_POINTS` config changes in the future, historical placements are unaffected — only newly-ingested stages use the new value. This preserves historical integrity in the same spirit as reason #1 above.
 - `Stage.playerCount` is snapshotted at ingestion (not derived by counting `Placement` rows live) so the scoring formula's `N` is fixed to what it was when the stage closed, even if `Placement` rows were ever corrected later.
 - `CardCache` uses Scryfall's own card id as primary key, avoiding a separate surrogate id and making upserts from `scryfall-integration-technical.md`'s resolution flow straightforward (`upsert` by `id`).
+- **`Season`** (added 2026-08-26, per the corner-case review): supports running a fresh league each year rather than one league forever. Every `Stage` — including the season-ending final (`isFinal = true`) — belongs to exactly one `Season`. Standings aggregation (`league-scoring-technical.md`) is scoped per `Season`, not computed globally across all seasons ever played.
+- **`Stage.isFinal`**: distinguishes the season-ending final tournament from regular stages. It's ingested through the same melee.gg sync pipeline as any other stage, but `league-scoring-technical.md`'s standings aggregation explicitly excludes `isFinal = true` stages — the final's own results are tracked and displayed (a "league champion" callout) but never feed back into league points, since qualification for the final is itself derived from the regular-season standings.
+- **`DecklistVisibilityMode`**: scoped **per `Season`**, not global — a season-level admin can choose to make decklists visible immediately for an archived/past season while a live season still defaults to hiding them until each stage closes. The default (`HIDDEN_UNTIL_STAGE_CLOSE`) avoids meta-leaking mid-event; see `decklists-technical.md` for enforcement details. This is the "configurable setting" from the admin panel — flipping it is one of the actions gated behind admin login (see `security-technical.md`).
+- **`AdminUser`**: backs the admin login system (see `security-technical.md`). Replaces the earlier single-shared-secret bearer token — actions gated behind it include triggering a melee.gg sync, resolving an `UnresolvedPlayerMatch`, and toggling `Season.decklistVisibilityMode`.
 
 ## Migrations
 
@@ -142,5 +185,6 @@ Managed via Prisma Migrate (`prisma migrate dev` locally, `prisma migrate deploy
 - `hosting-deployment-be-technical.md` — Neon as the Postgres host, and why (vs. Render's own Postgres).
 - `scryfall-integration-technical.md` — `CardCache` population, TTL, and fallback behavior.
 - `melee-integration-technical.md` — the ingestion flow that populates `Stage`, `Player`, `Placement`, `Decklist`, `DecklistEntry`.
-- `league-scoring-technical.md` — the formula used to compute `Placement.points` at ingestion time.
+- `league-scoring-technical.md` — the formula used to compute `Placement.points` at ingestion time, and standings aggregation scoped per `Season` while excluding `isFinal` stages.
 - `tournament-stage-technical.md`, `decklists-technical.md`, `player-technical.md` — module-level API/behavior built on top of `Stage`/`Decklist`/`Player` respectively.
+- `security-technical.md` — the `AdminUser` login system and which actions its guards protect.

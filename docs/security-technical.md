@@ -79,7 +79,52 @@ app.useGlobalPipes(new ValidationPipe({
 ## Authentication / admin actions
 
 - The public read endpoints (stage listings, standings, decklists, player pages) require no authentication — this is a public league tracker site.
-- Mutation/admin endpoints (triggering a melee.gg sync — see `melee-integration-technical.md`) are protected by a simple shared-secret bearer token guard (an `ADMIN_API_TOKEN` env var compared against an `Authorization: Bearer <token>` header via a Nest `CanActivate` guard). This is intentionally lightweight (no user accounts/sessions/OAuth) because the only "admin" is the league organizer and the operation is infrequent (once per stage close). If the admin surface grows, revisit in favor of a proper auth scheme — not needed for MVP scope.
+- Admin scope grew beyond a single infrequent action (per the 2026-08-26 corner-case review): it now covers triggering a melee.gg sync, resolving an `UnresolvedPlayerMatch`, and toggling `Season.decklistVisibilityMode` — for Mattia today, and potentially other trusted moderators later. A shared-secret bearer token no longer fits (no per-admin identity, no way to revoke one moderator without rotating the secret for everyone), so this is a **proper login system** backed by the `AdminUser` model (`data-model-technical.md`), not a bearer-token endpoint.
+
+### Login flow
+
+```
+POST /admin/auth/login
+```
+
+```ts
+interface AdminLoginRequest {
+  email: string;
+  password: string;
+}
+
+interface AdminLoginResponse {
+  accessToken: string;   // JWT, signed with ADMIN_JWT_SECRET
+  expiresIn: number;     // seconds
+}
+```
+
+- Passwords are stored as `AdminUser.passwordHash` (bcrypt or argon2, never plaintext, never logged) and verified with a constant-time compare (the hashing library's own `compare` function).
+- On success, a JWT is issued via `@nestjs/jwt`, signed with `ADMIN_JWT_SECRET` (env var, never hardcoded), short-lived (e.g. 12h `expiresIn`), carrying `{ sub: adminUser.id, role: adminUser.role }` as claims. `AdminUser.lastLoginAt` is updated.
+- On failure (unknown email, wrong password), the response is a generic `401 Unauthorized` with no indication of which part was wrong, to avoid user enumeration. Login attempts also go through the global rate limiter (above), with a stricter per-route throttle (e.g. `@Throttle({ default: { limit: 5, ttl: 60_000 } })`) to blunt brute-force attempts specifically.
+- The token is returned in the response body, not set as a cookie — the admin frontend stores it (e.g. in memory / `sessionStorage`) and sends it back as `Authorization: Bearer <accessToken>` on subsequent admin requests. This keeps `credentials: false` in the CORS policy above accurate and sidesteps CSRF concerns that cookie-based sessions would introduce.
+
+### Guarding admin routes
+
+A Nest `AdminAuthGuard` (backed by `passport-jwt` or an equivalent manual `CanActivate` verifying the JWT signature/expiry against `ADMIN_JWT_SECRET`) protects every admin-only route:
+
+```ts
+@UseGuards(AdminAuthGuard)
+@Post('admin/stages/:stageId/sync')
+syncStage(...) { /* see tournament-stage-technical.md §2 */ }
+
+@UseGuards(AdminAuthGuard)
+@Post('admin/player-matches/:id/resolve')
+resolvePlayerMatch(...) { /* see player-technical.md §4 */ }
+
+@UseGuards(AdminAuthGuard)
+@Patch('admin/seasons/:seasonId/decklist-visibility')
+setDecklistVisibility(...) { /* see decklists-technical.md §4, data-model-technical.md (Season.decklistVisibilityMode) */ }
+```
+
+- `AdminAuthGuard` rejects with `401 Unauthorized` for a missing/invalid/expired token — no route falls back to unauthenticated access.
+- `AdminUser.role` is available on the request (via the guard populating `request.adminUser` from the verified JWT claims) for any future action that needs to distinguish `ORGANIZER` from `MODERATOR`; no such distinction is enforced yet — all `AdminUser` accounts can perform all three guarded actions today, reserving `role` for future use as the admin surface grows.
+- These are exactly the three actions the corner-case review calls out as needing login-gated access: triggering a melee.gg sync, resolving an ambiguous player match, and toggling decklist visibility.
 
 ## Database hardening
 
@@ -94,6 +139,7 @@ app.useGlobalPipes(new ValidationPipe({
 
 ## Cross-references
 
-- `hosting-deployment-be-technical.md` — exactly how `DATABASE_URL`, `CORS_ORIGIN`, `ADMIN_API_TOKEN`, and deploy secrets are configured per environment (local, CI, Render staging/production).
+- `hosting-deployment-be-technical.md` — exactly how `DATABASE_URL`, `CORS_ORIGIN`, and deploy secrets are configured per environment (local, CI, Render staging/production); `ADMIN_JWT_SECRET` follows the same per-environment secret pattern described there even though that doc predates this section.
 - `backend-architecture-technical.md` — module structure that DTOs and guards attach to.
-- `data-model-technical.md` — schema the least-privilege DB role has scoped access to.
+- `data-model-technical.md` — schema the least-privilege DB role has scoped access to, including the `AdminUser` model this section authenticates against.
+- `tournament-stage-technical.md`, `player-technical.md`, `decklists-technical.md` — the three admin actions `AdminAuthGuard` protects.

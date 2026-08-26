@@ -20,8 +20,13 @@ Decklists are submitted by players on melee.gg as part of tournament registratio
 
 For a given player in a given stage, Prem League Tracker shows their submitted decklist as a readable card list, with card art and details pulled from Scryfall wherever we can match a card name. If a decklist is missing, incomplete, or a particular card entry couldn't be matched to a known card, that's shown transparently rather than silently hidden or guessed at.
 
+## When decklists become visible
+
+Showing a decklist too early can leak strategy mid-event — an opponent could scout a later pairing's deck before playing them. By default, a player's decklist for a stage stays hidden until that stage closes, then becomes visible automatically. An admin can override this per season (for example, to make a past/archived season's decklists visible right away) from the admin panel — see `security-overview.md` for how admin access works. While a decklist is hidden, the site (and the API behind it) simply doesn't serve its card list to the public; only its existence/status ("submitted, not yet visible") is shown.
+
 ## Related documents
 
 - `tournament-stage-overview.md` — the stage a decklist belongs to.
 - `player-overview.md` — whose decklist it is.
-- `decklists-technical.md` — storage model, Scryfall matching, and edge case handling.
+- `security-overview.md` — the admin login that gates the visibility override.
+- `decklists-technical.md` — storage model, Scryfall matching, visibility enforcement, and edge case handling.

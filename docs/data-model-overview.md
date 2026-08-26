@@ -15,9 +15,11 @@ Given all of that, Postgres is the right tool: a mature, well-understood relatio
 
 ## What we store
 
-- League stages (tappe) and each player's final placement in them.
+- **Seasons** — a fresh league runs each year, so every stage (and the season-ending final) belongs to a specific season rather than there being one league forever.
+- League stages (tappe) and each player's final placement in them, each scoped to a season. The season-ending final tournament is stored the same way as a stage, but flagged separately since its results are shown but don't count toward league points (see `league-scoring-overview.md`).
 - Players (name, and enough identity info to match them across stages).
-- Decklists submitted per player per stage, and the individual cards in them.
+- Decklists submitted per player per stage, and the individual cards in them, plus a visibility setting per season (decklists default to hidden until their stage closes — see `decklists-overview.md`).
+- Admin accounts for whoever operates the site (Mattia, and potentially other moderators later), used to log in and unlock admin-only actions (see `security-overview.md`).
 - A cache of card art/text looked up from Scryfall, so we don't need to ask Scryfall the same question over and over (see `scryfall-integration-overview.md`).
 
 ## Related docs
@@ -25,3 +27,4 @@ Given all of that, Postgres is the right tool: a mature, well-understood relatio
 - `data-model-technical.md` — full reasoning restated as the canonical decision record, plus the concrete schema.
 - `tournament-stage-overview.md`, `decklists-overview.md`, `player-overview.md`, `melee-integration-overview.md` — how each entity here is used day to day.
 - `scryfall-integration-overview.md` — the card cache specifically.
+- `security-overview.md` — the admin login system that gates sensitive actions.

@@ -26,7 +26,7 @@ model PlayerAlias {
   player        Player   @relation(fields: [playerId], references: [id])
   rawName       String   // exact name string as it appeared on melee.gg for a given stage
   normalizedName String  // see §2, stored for fast lookup/dedupe
-  meleeUserId   String?  // melee.gg's own account id for this participant, if the scraped page exposes it
+  meleeUserId   String?  // melee.gg's own account id for this participant, if the API response exposes it
   sourceStageId String?  // which stage's ingestion first produced this alias
   createdAt     DateTime @default(now())
 
@@ -68,7 +68,7 @@ This handles case, whitespace, and accent differences ("Gallinarò" vs "Gallinar
 When a stage sync produces a raw participant name (`rawName`) for a placement or pairing:
 
 1. Compute `normalizedName`.
-2. Look up `PlayerAlias` by `meleeUserId` first, if melee.gg's data exposes a stable per-account id for the participant (**this needs real-world verification against melee.gg's actual page structure** — see `melee-integration-technical.md` §Endpoints). A `meleeUserId` match is treated as authoritative and skips the steps below.
+2. Look up `PlayerAlias` by `meleeUserId` first, if melee.gg's API exposes a stable per-account id for the participant (**this needs confirming against melee.gg's real Swagger spec once access is obtained** — see `melee-integration-technical.md` §8). A `meleeUserId` match is treated as authoritative and skips the steps below.
 3. If no `meleeUserId` match, look up `PlayerAlias` by exact `normalizedName`.
    - **Exact match found** → attach this stage's result to that `Player`, and insert a new `PlayerAlias` row only if the exact `rawName` string hasn't been seen before for that player (keeps a history of observed spellings).
    - **No exact match** → run a fuzzy pass (e.g. Levenshtein distance or a trigram similarity threshold) against existing `Player.displayName` and `PlayerAlias.normalizedName` values. Any candidate above a configured similarity threshold is recorded as a candidate, **not** auto-attached.
@@ -109,6 +109,12 @@ Resolving:
 
 This is an admin-only, manual step by design (the league organizer). Automated fuzzy-merge is intentionally avoided — see the rationale in the section header.
 
+## 4a. Scoping to seasons
+
+`Player`, `PlayerAlias`, and `UnresolvedPlayerMatch` are **not** season-scoped — a player's cross-stage identity (which real person a name/alias resolves to) doesn't change from one season to the next, so identity resolution runs the same way regardless of which season a stage belongs to.
+
+What *is* season-scoped is which stages count toward which season's standings — that scoping lives on `Stage.seasonId` (see `tournament-stage-technical.md`), not on `Player`. A `Player`'s history transitively spans every season they've ever played, since each `StagePlacement` is reachable to exactly one `Stage`, which is reachable to exactly one `Season`. Season-scoped views (e.g. "this player's results in Season 2026") are a filter over `StagePlacement.stage.seasonId`, not a separate identity per season.
+
 ## 5. Interaction with scoring and standings
 
 A `StagePlacement` (defined in `league-scoring-technical.md`) requires a non-null `playerId`. A placement stuck in `UnresolvedPlayerMatch` limbo therefore does **not** yet have a `StagePlacement` row and does not contribute to standings until resolved. The stage-sync flow (`tournament-stage-technical.md`) reflects this: a stage can be `CLOSED` with some `UnresolvedPlayerMatch` rows outstanding, but the affected player(s)' points for that stage won't appear in standings until an admin resolves the match. The sync response and `StageSyncLog.message` should surface the count of unresolved matches so this isn't silently missed.
@@ -116,18 +122,20 @@ A `StagePlacement` (defined in `league-scoring-technical.md`) requires a non-nul
 ## 6. Player profile API
 
 ```
-GET /players/:playerId
+GET /players/:playerId?seasonId=<optional>
 ```
 
 ```ts
 interface PlayerProfileDto {
   id: string;
   displayName: string;
-  totalPoints: number;
-  stagesAttended: number;
+  totalPoints: number;       // scoped to seasonId if provided, otherwise all-time across every season
+  stagesAttended: number;    // same scoping as totalPoints
   stageResults: {
     stageId: string;
+    seasonId: string;
     stageName: string;
+    isFinal: boolean;        // included for transparency; final-stage results are also excluded from totalPoints — see league-scoring-technical.md
     placement: number;
     fieldSize: number;
     points: number;
@@ -136,6 +144,8 @@ interface PlayerProfileDto {
   knownAliases: string[]; // distinct rawName values across all PlayerAlias rows, for transparency/debugging
 }
 ```
+
+`seasonId` is an optional query param: when provided, `totalPoints`/`stagesAttended`/`stageResults` are filtered to that season only (matching the standings scoping in `league-scoring-technical.md` §3); when omitted, the profile shows the player's all-time history across every season they've played.
 
 ## 7. Failure modes
 

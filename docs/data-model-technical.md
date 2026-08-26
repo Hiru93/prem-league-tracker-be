@@ -24,9 +24,11 @@ With stage data persisted locally, standings computation becomes a query over ou
 
 ### 4. Traffic is tiny — keep infrastructure minimal
 
-At ~100 visits/day, none of the usual reasons to reach for heavier infrastructure apply: no need for read replicas, connection pooling middleware (PgBouncer), sharding, or a separate cache store (Redis) in front of Postgres. A single small managed Postgres instance handles this project's read and write volume with enormous headroom. This is also why the Scryfall card cache (see `scryfall-integration-technical.md`) is just another table in the same Postgres instance rather than a separate caching layer — introducing new infrastructure to cache data at this scale would be pure overhead.
+At ~100 visits/day, none of the usual reasons to reach for heavier infrastructure apply: no need for read replicas, connection pooling middleware (PgBouncer), or sharding. A single small managed Postgres instance handles this project's read and write volume with enormous headroom.
 
 This reasoning directly informs the hosting choice in `hosting-deployment-be-technical.md`: a free-tier managed Postgres (Neon) is not just acceptable but is actually the right fit for the actual scale of this project, not merely a cost-cutting compromise.
+
+**Revised 2026-08-26**: the Scryfall card cache is **not** a Postgres table (an earlier version of this doc had it as one, `CardCache`) — it now lives in Upstash Redis, per the Vercel+Neon+Upstash hosting revision. See `scryfall-integration-technical.md` for the Redis key scheme/TTL, and the `DecklistEntry` model below for how a decklist line references a resolved card without a Postgres FK into it.
 
 ### Ingestion model
 
@@ -133,44 +135,23 @@ model Decklist {
 }
 
 model DecklistEntry {
-  id             String     @id @default(cuid())
-  decklistId     String
-  decklist       Decklist   @relation(fields: [decklistId], references: [id])
-  rawCardName    String                          // exactly as imported, preserved even if unresolved
-  quantity       Int
-  isSideboard    Boolean    @default(false)
-  resolved       Boolean    @default(false)
-  cardCacheId    String?                         // FK to CardCache once resolved
-  cardCache      CardCache? @relation(fields: [cardCacheId], references: [id])
+  id              String    @id @default(cuid())
+  decklistId      String
+  decklist        Decklist  @relation(fields: [decklistId], references: [id])
+  rawCardName     String                          // exactly as imported, preserved even if unresolved
+  quantity        Int
+  isSideboard     Boolean   @default(false)
+  resolved        Boolean   @default(false)
+  scryfallCardId  String?                         // Scryfall's own card UUID once resolved — a lookup key into Redis, not a Postgres FK (see scryfall-integration-technical.md); no relation() here since the card data itself is never stored in this database
 
   @@index([decklistId])
-}
-
-model CardCache {
-  id               String   @id                  // Scryfall card id (their UUID) — natural key
-  normalizedName   String                         // lowercased/trimmed, for lookup
-  set              String?
-  collectorNumber  String?
-  name             String
-  manaCost         String?
-  typeLine         String?
-  oracleTextFront  String?
-  oracleTextBack   String?
-  imageUrlFront    String?
-  imageUrlBack     String?
-  isDoubleFaced    Boolean  @default(false)
-  colors           String[]                       // e.g. ["U", "R"]
-  fetchedAt        DateTime @default(now())
-  entries          DecklistEntry[]
-
-  @@index([normalizedName])
 }
 ```
 
 Notes:
 - `Placement.points` is persisted (not recomputed on every standings request) so that if `BASE_POINTS` config changes in the future, historical placements are unaffected — only newly-ingested stages use the new value. This preserves historical integrity in the same spirit as reason #1 above.
 - `Stage.playerCount` is snapshotted at ingestion (not derived by counting `Placement` rows live) so the scoring formula's `N` is fixed to what it was when the stage closed, even if `Placement` rows were ever corrected later.
-- `CardCache` uses Scryfall's own card id as primary key, avoiding a separate surrogate id and making upserts from `scryfall-integration-technical.md`'s resolution flow straightforward (`upsert` by `id`).
+- `DecklistEntry.scryfallCardId` stores Scryfall's own card id once resolved, but is not a Postgres foreign key — the card data it identifies lives in Redis, not this database, and may be evicted/re-resolved independently (see `scryfall-integration-technical.md`).
 - **`Season`** (added 2026-08-26, per the corner-case review): supports running a fresh league each year rather than one league forever. Every `Stage` — including the season-ending final (`isFinal = true`) — belongs to exactly one `Season`. Standings aggregation (`league-scoring-technical.md`) is scoped per `Season`, not computed globally across all seasons ever played.
 - **`Stage.isFinal`**: distinguishes the season-ending final tournament from regular stages. It's ingested through the same melee.gg sync pipeline as any other stage, but `league-scoring-technical.md`'s standings aggregation explicitly excludes `isFinal = true` stages — the final's own results are tracked and displayed (a "league champion" callout) but never feed back into league points, since qualification for the final is itself derived from the regular-season standings.
 - **`DecklistVisibilityMode`**: scoped **per `Season`**, not global — a season-level admin can choose to make decklists visible immediately for an archived/past season while a live season still defaults to hiding them until each stage closes. The default (`HIDDEN_UNTIL_STAGE_CLOSE`) avoids meta-leaking mid-event; see `decklists-technical.md` for enforcement details. This is the "configurable setting" from the admin panel — flipping it is one of the actions gated behind admin login (see `security-technical.md`).
@@ -182,8 +163,8 @@ Managed via Prisma Migrate (`prisma migrate dev` locally, `prisma migrate deploy
 
 ## Cross-references
 
-- `hosting-deployment-be-technical.md` — Neon as the Postgres host, and why (vs. Render's own Postgres).
-- `scryfall-integration-technical.md` — `CardCache` population, TTL, and fallback behavior.
+- `hosting-deployment-be-technical.md` — Neon as the Postgres host, and why (vs. Render's own Postgres); Upstash Redis as the Scryfall cache host.
+- `scryfall-integration-technical.md` — the Redis cache key scheme, TTL, and fallback behavior for resolving `DecklistEntry.scryfallCardId`.
 - `melee-integration-technical.md` — the ingestion flow that populates `Stage`, `Player`, `Placement`, `Decklist`, `DecklistEntry`.
 - `league-scoring-technical.md` — the formula used to compute `Placement.points` at ingestion time, and standings aggregation scoped per `Season` while excluding `isFinal` stages.
 - `tournament-stage-technical.md`, `decklists-technical.md`, `player-technical.md` — module-level API/behavior built on top of `Stage`/`Decklist`/`Player` respectively.

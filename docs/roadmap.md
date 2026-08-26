@@ -15,7 +15,7 @@ Per `docs/workflow.md`, every task is tracked as a GitHub Issue. A Project board
 | Phase | Covers |
 |---|---|
 | **0 — Foundations** | Repo setup, GitFlow branches, branch protection, initial documentation set, CI/CD skeleton, roadmap tracking itself. |
-| **1 — Backend Domain & Data Model** | Prisma schema, Postgres/Neon wiring, core entities (Stage, Player, Placement, Decklist, DecklistEntry, CardCache). |
+| **1 — Backend Domain & Data Model** | Prisma schema, Postgres/Neon wiring, core entities (Stage, Player, Placement, Decklist, DecklistEntry). |
 | **2 — Backend Integrations** | melee.gg ingestion (stages, placements, decklists, players) and Scryfall card resolution/caching. |
 | **3 — Backend API & Scoring** | League scoring computation, standings aggregation, the REST API matching `backend-api-contract-technical.md`. |
 | **4 — Frontend Build-out** | League standings, tournament-stage, decklist, and player-profile screens; RTK Query wiring against the live API. |
